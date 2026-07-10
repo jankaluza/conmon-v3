@@ -8,7 +8,6 @@ upstream_tag_template: v{version}
 # fix-spec-file runs on Copr only; see .packit-copr-rpm.sh
 srpm_build_deps:
   - cargo
-  - git-archive-all
   - make
 
 actions:
