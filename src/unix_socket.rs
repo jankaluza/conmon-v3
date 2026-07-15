@@ -535,24 +535,32 @@ impl UnixSocket {
     /// * The RemoteSocket with new client connection. The type of the RemoteSocket
     ///   is the same as type of this UnixSocket.
     pub fn accept(&self) -> ConmonResult<Option<RemoteSocket>> {
-        if self.fd.is_none() {
+        let Some(fd) = self.fd.as_ref() else {
             return Ok(None);
-        }
+        };
 
-        match accept(self.fd.as_ref().unwrap().as_raw_fd()) {
-            Ok(new_fd) => {
-                info!(
-                    "Accepted new remote connection on socket {:?}: {}",
-                    self.path, new_fd
-                );
-                let remote =
-                    RemoteSocket::new(self.socket_type, unsafe { OwnedFd::from_raw_fd(new_fd) });
-                Ok(Some(remote))
-            }
-            Err(Errno::EWOULDBLOCK) => Ok(None),
-            Err(e) => {
-                eprintln!("warn: Failed to accept client connection on attach socket: {e}");
-                Ok(None)
+        loop {
+            match accept(fd.as_raw_fd()) {
+                Ok(new_fd) => {
+                    info!(
+                        "Accepted new remote connection on socket {:?}: {}",
+                        self.path, new_fd
+                    );
+                    let remote = RemoteSocket::new(self.socket_type, unsafe {
+                        OwnedFd::from_raw_fd(new_fd)
+                    });
+                    return Ok(Some(remote));
+                }
+                Err(Errno::EINTR) => continue,
+                #[allow(unreachable_patterns)]
+                // EAGAIN and EWOULDBLOCK are distinct on some platforms.
+                Err(Errno::EAGAIN) | Err(Errno::EWOULDBLOCK) => return Ok(None),
+                Err(e) => {
+                    return Err(ConmonError::new(
+                        format!("Failed to accept client connection on {:?}: {e}", self.path),
+                        1,
+                    ));
+                }
             }
         }
     }

@@ -11,16 +11,24 @@ use nix::{
     libc::{SHUT_RD, shutdown},
     poll::{PollFd, PollFlags, poll},
     sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg},
-    unistd::{pipe2, read},
+    sys::wait::{Id, WaitPidFlag, WaitStatus, waitid},
+    unistd::{Pid, pipe2, read},
 };
 
 use std::{
     io::{self, IoSliceMut},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 
 use log::{debug, info};
+
+/// Maximum time to wait for the runtime to connect on `--console-socket` and send the pty fd.
+const CONSOLE_SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const CONSOLE_SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Max SCM_RIGHTS descriptors accepted in one `recvmsg`.
+const MAX_SCM_RIGHTS_FDS: usize = 4;
 
 /// Creates new pipe and return read/write fds.
 ///
@@ -74,98 +82,190 @@ pub fn read_pipe(fd: &OwnedFd, buf: &mut [u8]) -> ConmonResult<usize> {
 }
 
 /// Result of the `recv_data_and_fds` function.
-pub struct RecvResult {
-    /// The number of bytes read.
+struct RecvResult {
     n: usize,
-
-    /// The file descriptors received.
-    fds: Vec<RawFd>,
+    /// Owned SCM_RIGHTS descriptors (at most [`MAX_SCM_RIGHTS_FDS`]).
+    fds: Vec<OwnedFd>,
 }
 
-/// Receives data and file descriptors from existing file descriptor.
-///
-/// The file descriptors must be sent using the ScmRights Control message.
-///
-/// # Returns
-///
-/// * The `RecvResult` with number of bytes read and file descriptors received.
-///
-/// # Arguments
-///
-/// * `fd` - The file descriptor to read the data and fds from.
-/// * `buf` - The buffer to write the data into.
-///
-/// # Errors
-///
-/// * [`ConmonError`] on any error.
+/// Receives data and SCM_RIGHTS file descriptors. Every received FD is wrapped
+/// in [`OwnedFd`] immediately so unused extras cannot leak.
 fn recv_data_and_fds(fd: RawFd, buf: &mut [u8]) -> nix::Result<RecvResult> {
     let mut iov = [IoSliceMut::new(buf)];
-    let mut cmsgspace = cmsg_space!([RawFd; 4]);
+    let mut cmsgspace = cmsg_space!([RawFd; MAX_SCM_RIGHTS_FDS]);
 
     let msg = recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsgspace), MsgFlags::empty())?;
 
     let mut fds = Vec::new();
-    let rights = msg.cmsgs()?.next();
-    if let Some(ControlMessageOwned::ScmRights(rights)) = rights {
-        fds.extend(rights);
+    if let Some(ControlMessageOwned::ScmRights(rights)) = msg.cmsgs()?.next() {
+        fds.extend(rights.into_iter().map(|raw| {
+            // SAFETY: `raw` is an FD newly received via SCM_RIGHTS from
+            // `recvmsg`. We take ownership exactly once here; unused FDs
+            // are closed when their `OwnedFd` is dropped.
+            unsafe { OwnedFd::from_raw_fd(raw) }
+        }));
     }
     Ok(RecvResult { n: msg.bytes, fds })
 }
 
-/// Accepts the console_socket connection and returns the fd sent over it.
+/// Accepts the console-socket connection and returns the terminal FD sent over it.
 ///
-/// This function blocks until the fd is received.
-///
-/// # Returns
-///
-/// * The `RemoteSocket` based on the file descriptor received over `console_socket`.
-///
-/// # Arguments
-///
-/// * `console_socket` - The `UnixSocket` to receive the console file-descriptor from.
-///
-/// # Errors
-///
-/// * [`ConmonError`] on any error.
-pub fn receive_console_fd(console_socket: UnixSocket) -> ConmonResult<RemoteSocket> {
-    // Block on accept until we have some connection.
-    let remote = console_socket.accept()?;
-    if let Some(r) = remote {
-        // We actually do not care about the data received. We care only about fd.
-        let mut buf = [0u8; 8192];
-        match recv_data_and_fds(r.fd.as_raw_fd(), &mut buf) {
-            Ok(res) => {
-                let n = res.n;
-                if n > 0 {
-                    let received_fd = res.fds.first();
-                    if let Some(rfd) = received_fd {
-                        debug!("Received console fd {}", rfd);
-                        let owned_fd = unsafe { OwnedFd::from_raw_fd(*rfd) };
-                        let ret = RemoteSocket::new(SocketType::Terminal, owned_fd);
-                        return Ok(ret);
-                    }
-                } else {
-                    return Err(ConmonError::new(
-                        "No file descriptor received using console socket.",
-                        1,
-                    ));
-                }
+/// Polls with a timeout and watches for runtime exit via non-reaping `waitid`.
+/// On runtime exit, one final non-blocking attempt drains an already-queued
+/// connection or FD before failing.
+pub fn receive_console_fd(
+    console_socket: UnixSocket,
+    runtime_pid: Option<Pid>,
+) -> ConmonResult<RemoteSocket> {
+    receive_console_fd_with_timeout(console_socket, runtime_pid, CONSOLE_SOCKET_WAIT_TIMEOUT)
+}
+
+fn receive_console_fd_with_timeout(
+    console_socket: UnixSocket,
+    runtime_pid: Option<Pid>,
+    timeout: Duration,
+) -> ConmonResult<RemoteSocket> {
+    let listen_fd = console_socket.fd().ok_or_else(|| {
+        ConmonError::new(
+            "Cannot receive console socket file descriptor without console socket.",
+            1,
+        )
+    })?;
+    let deadline = Instant::now() + timeout;
+
+    let remote = wait_until_console_ready(
+        deadline,
+        runtime_pid,
+        "Timed out waiting for runtime to connect on console socket",
+        |wait| {
+            if poll_fd(listen_fd.as_fd(), wait)? {
+                console_socket.accept()
+            } else {
+                Ok(None)
             }
-            Err(e) => {
+        },
+    )?;
+
+    wait_until_console_ready(
+        deadline,
+        runtime_pid,
+        "Timed out waiting for console fd over console socket",
+        |wait| {
+            if poll_fd(remote.fd.as_fd(), wait)? {
+                try_receive_console_fd(remote.fd.as_fd())
+            } else {
+                Ok(None)
+            }
+        },
+    )
+}
+
+/// Shared wait loop for accept and FD receive. On runtime exit, tries once more
+/// with a zero timeout before failing (queued connection/FD race).
+fn wait_until_console_ready(
+    deadline: Instant,
+    runtime_pid: Option<Pid>,
+    timeout_msg: &str,
+    mut try_progress: impl FnMut(Duration) -> ConmonResult<Option<RemoteSocket>>,
+) -> ConmonResult<RemoteSocket> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ConmonError::new(timeout_msg, 1));
+        }
+        let wait = remaining.min(CONSOLE_SOCKET_POLL_INTERVAL);
+
+        if let Some(value) = try_progress(wait)? {
+            return Ok(value);
+        }
+
+        if let Some(status) = runtime_exit_status(runtime_pid)? {
+            if let Some(value) = try_progress(Duration::ZERO)? {
+                return Ok(value);
+            }
+            return Err(ConmonError::new(
+                format!("Runtime process exited with status {status} before sending console fd"),
+                1,
+            ));
+        }
+    }
+}
+
+fn try_receive_console_fd(fd: BorrowedFd<'_>) -> ConmonResult<Option<RemoteSocket>> {
+    let mut buf = [0u8; 1];
+    match recv_data_and_fds(fd.as_raw_fd(), &mut buf) {
+        Ok(res) if res.n > 0 => {
+            let mut fds = res.fds.into_iter();
+            let Some(owned_fd) = fds.next() else {
+                return Err(ConmonError::new(
+                    "No file descriptor received using console socket.",
+                    1,
+                ));
+            };
+            drop(fds); // close any extra SCM_RIGHTS descriptors
+            debug!("Received console fd {}", owned_fd.as_raw_fd());
+            Ok(Some(RemoteSocket::new(SocketType::Terminal, owned_fd)))
+        }
+        Ok(_) => Err(ConmonError::new(
+            "Console socket closed before file descriptor was received.",
+            1,
+        )),
+        #[allow(unreachable_patterns)]
+        Err(Errno::EAGAIN) | Err(Errno::EWOULDBLOCK) => Ok(None),
+        Err(e) => Err(ConmonError::new(
+            format!("Error receiving file descriptor using console socket: {e}"),
+            1,
+        )),
+    }
+}
+
+/// Non-reaping runtime exit check (`waitid` + `WNOWAIT`).
+fn runtime_exit_status(runtime_pid: Option<Pid>) -> ConmonResult<Option<i32>> {
+    let Some(pid) = runtime_pid else {
+        return Ok(None);
+    };
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG;
+    loop {
+        match waitid(Id::Pid(pid), flags) {
+            Ok(WaitStatus::Exited(_, status)) => return Ok(Some(status)),
+            Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(Some(128 + sig as i32)),
+            Ok(_) => return Ok(None),
+            Err(Errno::EINTR) => continue,
+            Err(Errno::ECHILD) => {
                 return Err(ConmonError::new(
                     format!(
-                        "Error receiving file descriptor using console socket: {}",
-                        e
+                        "waitid({pid}): unexpected ECHILD; runtime should remain waitable until session cleanup"
                     ),
                     1,
                 ));
             }
+            Err(e) => {
+                return Err(ConmonError::new(format!("waitid({pid}) failed: {e}"), 1));
+            }
         }
     }
-    Err(ConmonError::new(
-        "Cannot receive console socket file descriptor without console socket.",
-        1,
-    ))
+}
+
+/// Single `poll()`. `EINTR` returns `Ok(false)` so the caller recomputes remaining time.
+fn poll_fd(fd: BorrowedFd<'_>, timeout: Duration) -> ConmonResult<bool> {
+    let timeout_ms = timeout.as_millis().min(u16::MAX as u128) as u16;
+    let mut pollfds = [PollFd::new(fd, PollFlags::POLLIN)];
+    match poll(&mut pollfds, timeout_ms) {
+        Ok(0) => Ok(false),
+        Ok(_) => Ok(pollfds[0].revents().is_some_and(|r| {
+            r.intersects(
+                PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL,
+            )
+        })),
+        Err(Errno::EINTR) => Ok(false),
+        Err(e) => Err(ConmonError::new(
+            format!(
+                "poll() failed while waiting for console socket: {}",
+                io::Error::from_raw_os_error(e as i32)
+            ),
+            1,
+        )),
+    }
 }
 
 /// Remove a console/terminal peer FD from forward lists before its `OwnedFd` is dropped.
@@ -462,10 +562,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unix_socket::{SocketType, UnixSocket};
     use nix::sys::socket::{
         AddressFamily, ControlMessage, SockFlag, SockType, sendmsg, socketpair,
     };
+    use nix::sys::stat::Mode;
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
     use std::io::IoSlice;
+    use std::os::unix::net::UnixStream;
+    use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn test_console_socket() -> ConmonResult<(tempfile::TempDir, UnixSocket)> {
+        let tmp = tempdir().map_err(|e| ConmonError::new(e.to_string(), 1))?;
+        let mut s = UnixSocket::new(
+            SocketType::Terminal,
+            false,
+            tmp.path().to_path_buf(),
+            None,
+            None,
+        );
+        s.bind(
+            Some(tmp.path().join("console.sock")),
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            Mode::from_bits_truncate(0o700),
+        )?;
+        s.listen()?;
+        Ok((tmp, s))
+    }
 
     fn send_fds(count: usize, payload: &[u8]) -> ConmonResult<(OwnedFd, Vec<(OwnedFd, OwnedFd)>)> {
         let (sender, receiver) = socketpair(
@@ -474,43 +601,126 @@ mod tests {
             None,
             SockFlag::empty(),
         )?;
-
         let mut keepalive = Vec::new();
-        let mut fds_to_send: Vec<RawFd> = Vec::new();
+        let mut fds = Vec::new();
         for _ in 0..count {
             let (r, w) = pipe2(OFlag::O_CLOEXEC)?;
-            fds_to_send.push(r.as_raw_fd());
+            fds.push(r.as_raw_fd());
             keepalive.push((r, w));
         }
-
-        let iov = [IoSlice::new(payload)];
-        let cmsg = ControlMessage::ScmRights(&fds_to_send);
-        sendmsg::<()>(sender.as_raw_fd(), &iov, &[cmsg], MsgFlags::empty(), None)?;
-
+        sendmsg::<()>(
+            sender.as_raw_fd(),
+            &[IoSlice::new(payload)],
+            &[ControlMessage::ScmRights(&fds)],
+            MsgFlags::empty(),
+            None,
+        )?;
         Ok((receiver, keepalive))
+    }
+
+    fn wait_exited_nowait(pid: Pid) {
+        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG;
+        loop {
+            match waitid(Id::Pid(pid), flags).unwrap() {
+                WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => return,
+                _ => thread::sleep(Duration::from_millis(10)),
+            }
+        }
     }
 
     #[test]
     fn recv_data() -> ConmonResult<()> {
-        let payload = b"foo";
-        let (receiver, _keepalive) = send_fds(1, payload)?;
-
+        let (receiver, _k) = send_fds(1, b"foo")?;
         let mut buf = [0u8; 16];
         let res = recv_data_and_fds(receiver.as_raw_fd(), &mut buf)?;
-        assert_eq!(res.n, payload.len());
-        assert_eq!(&buf[..payload.len()], payload);
+        assert_eq!(res.n, 3);
+        assert_eq!(&buf[..3], b"foo");
         assert_eq!(res.fds.len(), 1);
         Ok(())
     }
 
-    /// `recv_data_and_fds` only expects at max 4 fds in the `SCM_RIGHTS` control message.
     #[test]
     fn recv_data_too_many_scm_rights() -> ConmonResult<()> {
-        let (receiver, _keepalive) = send_fds(5, b"foo")?;
-
+        let (receiver, _k) = send_fds(MAX_SCM_RIGHTS_FDS + 1, b"foo")?;
         let mut buf = [0u8; 16];
-        let recv = recv_data_and_fds(receiver.as_raw_fd(), &mut buf);
-        assert_eq!(recv.err(), Some(Errno::ENOBUFS));
+        assert_eq!(
+            recv_data_and_fds(receiver.as_raw_fd(), &mut buf).err(),
+            Some(Errno::ENOBUFS)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn receive_console_fd_times_out_without_connection() -> ConmonResult<()> {
+        let (_tmp, sock) = test_console_socket()?;
+        let err =
+            receive_console_fd_with_timeout(sock, None, Duration::from_millis(200)).unwrap_err();
+        assert!(err.msg.contains("Timed out waiting for runtime to connect"));
+        Ok(())
+    }
+
+    #[test]
+    fn receive_console_fd_gets_passed_fd() -> ConmonResult<()> {
+        let (_tmp, sock) = test_console_socket()?;
+        let path = sock.path().unwrap().clone();
+        let peer = thread::spawn(move || {
+            let client = UnixStream::connect(path).unwrap();
+            let (r, w) = pipe2(OFlag::O_CLOEXEC).unwrap();
+            drop(w);
+            sendmsg::<()>(
+                client.as_raw_fd(),
+                &[IoSlice::new(b"x")],
+                &[ControlMessage::ScmRights(&[r.as_raw_fd()])],
+                MsgFlags::empty(),
+                None,
+            )
+            .unwrap();
+        });
+        let terminal = receive_console_fd_with_timeout(sock, None, Duration::from_secs(5))?;
+        assert_eq!(terminal.socket_type, SocketType::Terminal);
+        peer.join().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_exit_status_does_not_reap_child() {
+        let mut child = Command::new("sh").args(["-c", "exit 42"]).spawn().unwrap();
+        let pid = Pid::from_raw(child.id() as i32);
+        wait_exited_nowait(pid);
+        assert_eq!(runtime_exit_status(Some(pid)).unwrap(), Some(42));
+        assert_eq!(child.wait().unwrap().code(), Some(42));
+    }
+
+    #[test]
+    fn receive_console_fd_fails_when_runtime_exits() -> ConmonResult<()> {
+        let (_tmp, sock) = test_console_socket()?;
+        let mut child = Command::new("sh").args(["-c", "exit 42"]).spawn().unwrap();
+        let pid = Pid::from_raw(child.id() as i32);
+        let err =
+            receive_console_fd_with_timeout(sock, Some(pid), Duration::from_secs(5)).unwrap_err();
+        let _ = child.wait();
+        assert!(err.msg.contains("Runtime process exited with status 42"));
+        Ok(())
+    }
+
+    #[test]
+    fn accept_propagates_errors() -> ConmonResult<()> {
+        let tmp = tempdir().map_err(|e| ConmonError::new(e.to_string(), 1))?;
+        let mut sock = UnixSocket::new(
+            SocketType::Terminal,
+            false,
+            tmp.path().to_path_buf(),
+            None,
+            None,
+        );
+        sock.bind(
+            Some(tmp.path().join("nolisten.sock")),
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            Mode::from_bits_truncate(0o700),
+        )?;
+        let err = sock.accept().unwrap_err();
+        assert!(err.msg.contains("Failed to accept client connection"));
         Ok(())
     }
 
