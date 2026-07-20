@@ -1,6 +1,7 @@
 use std::{
     fmt,
-    os::fd::{AsFd, OwnedFd},
+    io::IoSlice,
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
     path::{Path, PathBuf},
 };
 
@@ -620,6 +621,73 @@ pub enum Socket {
     Invalid(),
 }
 
+/// Retry a syscall that may return `EINTR` before completion.
+fn retry_on_eintr<T, F>(mut f: F) -> Result<T, Errno>
+where
+    F: FnMut() -> Result<T, Errno>,
+{
+    loop {
+        match f() {
+            Err(Errno::EINTR) => continue,
+            result => return result,
+        }
+    }
+}
+
+/// Forward one attach chunk to a client fd.
+///
+/// Returns `true` if the client should be kept.
+fn forward_to_attach_client(fd: i32, prefix: &[u8], chunk: &[u8]) -> bool {
+    let expected = prefix.len() + chunk.len();
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let iov = [IoSlice::new(prefix), IoSlice::new(chunk)];
+    match retry_on_eintr(|| writev(borrowed, &iov)) {
+        Ok(n) if n == expected => true,
+        Ok(n) => {
+            warn!(
+                "Unexpected partial writev to attach fd {} ({} of {}); dropping",
+                fd, n, expected
+            );
+            false
+        }
+        Err(Errno::EAGAIN) => true,
+        Err(e) => {
+            warn!(
+                "Failed to forward output to attach fd {}: {}; dropping",
+                fd, e
+            );
+            false
+        }
+    }
+}
+
+/// Forward console input to a terminal fd.
+///
+/// Returns `true` if the peer should be kept.
+fn forward_to_terminal_client(fd: i32, data: &[u8]) -> bool {
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    match retry_on_eintr(|| write(borrowed, data)) {
+        Ok(n) if n == data.len() => true,
+        Ok(n) => {
+            warn!(
+                "Partial write to terminal fd {} ({} of {}); keeping peer, dropping remainder of this chunk",
+                fd,
+                n,
+                data.len()
+            );
+            true
+        }
+        Err(Errno::EAGAIN) => true,
+        Err(e) => {
+            warn!(
+                "Failed to forward input to terminal fd {}: {}; dropping",
+                fd, e
+            );
+            false
+        }
+    }
+}
+
 impl Socket {
     /// Handles the POLLIN event for a Socket.
     ///
@@ -640,8 +708,8 @@ impl Socket {
         log_plugin: &mut dyn LogPlugin,
         new_sockets: &mut Vec<RemoteSocket>,
         workerfd_stdin: Option<&OwnedFd>,
-        console_fds: &Vec<i32>,
-        terminal_fds: &Vec<i32>,
+        console_fds: &mut Vec<i32>,
+        terminal_fds: &mut Vec<i32>,
         stdout_fd: i32,
         sdnotify_socket: &Option<PathBuf>,
     ) -> ConmonResult<bool> {
@@ -691,16 +759,15 @@ impl Socket {
                         // buffer has 8192+1 bytes. It would be nice to unify that, but we need to
                         // keep the backwards compatibility for now. We also have to keep using
                         // SOCKET_SEQPACKET and therefore everything needs to be sent in a single packet.
+                        // SEQPACKET delivers whole messages atomically, so a successful writev must
+                        // return the full prefix+chunk length; anything else is treated as fatal for
+                        // that attach client.
                         let data = &r.buf[..bytes_read];
                         for chunk in data.chunks(CONMON_CLIENT_BUFFER_SIZE) {
-                            for &fd in console_fds {
-                                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-                                let iov = [
-                                    std::io::IoSlice::new(prefix_buf),
-                                    std::io::IoSlice::new(chunk),
-                                ];
-                                writev(borrowed, &iov)?;
-                            }
+                            // Delivery is best-effort. EAGAIN keeps the client but drops the current
+                            // packet to avoid blocking the event loop. Permanent errors remove it.
+                            console_fds
+                                .retain(|&fd| forward_to_attach_client(fd, prefix_buf, chunk));
                         }
                         r.clear_buffer();
                     }
@@ -710,12 +777,14 @@ impl Socket {
                             let bytes_written = write(workerfd_stdin, &r.buf[..bytes_read])?;
                             info!("bytes written: {}", bytes_written);
                         }
-                        // Forward data to terminal.
-                        for &fd in terminal_fds {
+                        // Forward data to terminal. Delivery is best-effort: transient
+                        // errors and short writes keep the peer (remaining bytes of this
+                        // chunk may be dropped to avoid blocking the event loop). Permanent
+                        // errors drop the peer from the forward list.
+                        terminal_fds.retain(|&fd| {
                             debug!("Forwarding to terminal {}", fd);
-                            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-                            write(borrowed, &r.buf[..bytes_read])?;
-                        }
+                            forward_to_terminal_client(fd, &r.buf[..bytes_read])
+                        });
                         r.clear_buffer();
                     }
                     SocketType::Notify => {
@@ -763,5 +832,137 @@ impl Socket {
             }
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use nix::unistd::pipe2;
+
+    fn set_nonblocking(fd: &OwnedFd) -> nix::Result<()> {
+        let flags = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL)?);
+        fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map(|_| ())
+    }
+
+    fn fill_pipe(write_fd: &OwnedFd) {
+        set_nonblocking(write_fd).unwrap();
+        let chunk = vec![0u8; 65536];
+        loop {
+            match write(write_fd, &chunk) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(Errno::EAGAIN) => break,
+                Err(e) => panic!("fill_pipe: {e}"),
+            }
+        }
+    }
+
+    fn prepare_pipe_with_free_bytes(free_bytes: usize) -> nix::Result<(OwnedFd, OwnedFd)> {
+        let (r, w) = pipe2(OFlag::O_CLOEXEC)?;
+        fill_pipe(&w);
+        if free_bytes > 0 {
+            let mut buf = vec![0u8; free_bytes];
+            assert_eq!(read(&r, &mut buf)?, free_bytes);
+        }
+        Ok((r, w))
+    }
+
+    #[test]
+    fn retry_on_eintr_retries_until_success() {
+        let mut attempts = 0;
+        let result = retry_on_eintr(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(Errno::EINTR)
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(result, Ok(7));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn forward_to_attach_client_delivers_chunk_after_eintr() -> nix::Result<()> {
+        let (r, w) = pipe2(OFlag::O_CLOEXEC)?;
+        let mut attempts = 0;
+        let prefix = [2u8];
+        let chunk = b"hi";
+        let expected = prefix.len() + chunk.len();
+        let borrowed = unsafe { BorrowedFd::borrow_raw(w.as_raw_fd()) };
+        let iov = [IoSlice::new(&prefix), IoSlice::new(chunk)];
+
+        let result = retry_on_eintr(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(Errno::EINTR)
+            } else {
+                writev(borrowed, &iov)
+            }
+        });
+        assert_eq!(result, Ok(expected));
+        assert_eq!(attempts, 2);
+
+        let mut buf = [0u8; 8];
+        assert_eq!(read(&r, &mut buf)?, expected);
+        assert_eq!(&buf[..expected], &[2, b'h', b'i']);
+        Ok(())
+    }
+
+    #[test]
+    fn forward_to_attach_client_eagain_keeps_peer() -> nix::Result<()> {
+        let (_r, w) = pipe2(OFlag::O_CLOEXEC)?;
+        fill_pipe(&w);
+
+        assert!(forward_to_attach_client(w.as_raw_fd(), &[2], b"blocked"));
+        Ok(())
+    }
+
+    #[test]
+    fn forward_to_attach_client_permanent_error_removes_peer() -> nix::Result<()> {
+        let (r, w) = pipe2(OFlag::O_CLOEXEC)?;
+        drop(r);
+
+        assert!(!forward_to_attach_client(w.as_raw_fd(), &[2], b"gone"));
+        Ok(())
+    }
+
+    #[test]
+    fn forward_to_attach_client_partial_write_drops_peer() -> nix::Result<()> {
+        let (_r, w) = prepare_pipe_with_free_bytes(5000)?;
+        let prefix = [2u8];
+        let chunk = vec![b'x'; 10_000];
+        assert!(!forward_to_attach_client(w.as_raw_fd(), &prefix, &chunk));
+        Ok(())
+    }
+
+    #[test]
+    fn forward_to_terminal_client_partial_write_keeps_peer() -> nix::Result<()> {
+        let (_r, w) = prepare_pipe_with_free_bytes(5000)?;
+        assert!(forward_to_terminal_client(
+            w.as_raw_fd(),
+            &vec![b'y'; 10_000]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn forward_to_terminal_client_eagain_keeps_peer() -> nix::Result<()> {
+        let (_r, w) = pipe2(OFlag::O_CLOEXEC)?;
+        fill_pipe(&w);
+
+        assert!(forward_to_terminal_client(w.as_raw_fd(), b"blocked"));
+        Ok(())
+    }
+
+    #[test]
+    fn forward_to_terminal_client_permanent_error_removes_peer() -> nix::Result<()> {
+        let (r, w) = pipe2(OFlag::O_CLOEXEC)?;
+        drop(r);
+
+        assert!(!forward_to_terminal_client(w.as_raw_fd(), b"gone"));
+        Ok(())
     }
 }
