@@ -3,16 +3,18 @@ use crate::exit::set_subreaper;
 use crate::runtime::stdio::read_pipe;
 
 use log::{info, warn};
+use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
 use nix::sys::stat::Mode;
-use nix::sys::wait::{WaitStatus, waitpid};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{
     ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, getpid, getppid, setsid,
 };
 
 use std::env;
-use std::io::{Error, Result as IoResult};
+use std::fs;
+use std::io::{Error, ErrorKind, Result as IoResult};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -22,6 +24,80 @@ use std::process::{Command, Stdio, exit};
 /// Convert a nix::Error into std::io::Error (for use inside pre_exec closure).
 fn io_err(e: nix::Error) -> Error {
     Error::from_raw_os_error(e as i32)
+}
+
+/// Definitive liveness of a process as observed via `/proc`.
+///
+/// Callers must not treat [`ProcessStatus::Unknown`] as exit: that covers
+/// permission failures, transient I/O errors, and unparseable `/proc` contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessStatus {
+    /// Process exists and is not zombie/dead.
+    Running,
+    /// Process is gone (`ENOENT`) or is zombie/dead (`Z`/`X`/`x`).
+    Exited,
+    /// Status could not be determined; keep polling / retry.
+    Unknown,
+}
+
+/// Parse the one-letter process state from the contents of `/proc/<pid>/stat`.
+fn state_from_proc_stat(contents: &str) -> Option<char> {
+    let rparen = contents.rfind(')')?;
+    contents.get(rparen + 2..)?.chars().next()
+}
+
+fn process_status_from_state(state: char) -> ProcessStatus {
+    match state {
+        // Zombie or dead: treat as exited. `kill(pid, 0)` still succeeds for zombies.
+        'Z' | 'X' | 'x' => ProcessStatus::Exited,
+        _ => ProcessStatus::Running,
+    }
+}
+
+/// Map a `/proc/<pid>/stat` read result to [`ProcessStatus`].
+///
+/// Only `NotFound` and a definitive zombie/dead state mean [`ProcessStatus::Exited`].
+/// Any other I/O failure or parse failure is [`ProcessStatus::Unknown`].
+fn process_status_from_stat_result(result: Result<String, Error>) -> ProcessStatus {
+    match result {
+        Ok(contents) => match state_from_proc_stat(&contents) {
+            Some(state) => process_status_from_state(state),
+            None => ProcessStatus::Unknown,
+        },
+        Err(e) if e.kind() == ErrorKind::NotFound => ProcessStatus::Exited,
+        Err(_) => ProcessStatus::Unknown,
+    }
+}
+
+/// Observe whether `pid` is still running via `/proc/<pid>/stat`.
+///
+/// `kill(pid, 0)` also succeeds for zombie processes, so callers must not use
+/// that syscall alone to decide whether a container is still running.
+pub fn process_status(pid: i32) -> ProcessStatus {
+    if pid <= 0 {
+        return ProcessStatus::Unknown;
+    }
+    process_status_from_stat_result(fs::read_to_string(format!("/proc/{pid}/stat")))
+}
+
+/// Non-blocking wait for a specific PID.
+///
+/// As subreaper, conmon may reap orphaned container processes this way even when
+/// they are not returned by `waitpid(-1, WNOHANG)`.
+pub fn try_wait_process(pid: i32) -> Result<Option<WaitStatus>, Errno> {
+    let pid = Pid::from_raw(pid);
+    loop {
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => return Ok(None),
+            Ok(status @ (WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _))) => {
+                return Ok(Some(status));
+            }
+            Ok(_) => return Ok(None),
+            Err(Errno::ECHILD) => return Ok(None),
+            Err(Errno::EINTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Block signals in the parent before we spawn.
@@ -235,5 +311,106 @@ impl RuntimeProcess {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_from_proc_stat_parses_zombie() {
+        assert_eq!(state_from_proc_stat("42 (sh) Z 1 42 42"), Some('Z'));
+    }
+
+    #[test]
+    fn state_from_proc_stat_parses_running() {
+        assert_eq!(state_from_proc_stat("99 (sleep) S 1 99 99"), Some('S'));
+    }
+
+    #[test]
+    fn state_from_proc_stat_rejects_malformed() {
+        assert_eq!(state_from_proc_stat("no-paren Z"), None);
+        assert_eq!(state_from_proc_stat("1 (x)"), None);
+    }
+
+    #[test]
+    fn process_status_from_stat_result_running() {
+        assert_eq!(
+            process_status_from_stat_result(Ok("99 (sleep) S 1 99 99".into())),
+            ProcessStatus::Running
+        );
+    }
+
+    #[test]
+    fn process_status_from_stat_result_zombie_is_exited() {
+        assert_eq!(
+            process_status_from_stat_result(Ok("42 (sh) Z 1 42 42".into())),
+            ProcessStatus::Exited
+        );
+    }
+
+    #[test]
+    fn process_status_from_stat_result_dead_is_exited() {
+        assert_eq!(
+            process_status_from_stat_result(Ok("7 (x) X 1 7 7".into())),
+            ProcessStatus::Exited
+        );
+    }
+
+    #[test]
+    fn process_status_from_stat_result_enoent_is_exited() {
+        assert_eq!(
+            process_status_from_stat_result(Err(Error::new(
+                ErrorKind::NotFound,
+                "No such file or directory"
+            ))),
+            ProcessStatus::Exited
+        );
+    }
+
+    #[test]
+    fn process_status_from_stat_result_permission_is_unknown() {
+        assert_eq!(
+            process_status_from_stat_result(Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Permission denied"
+            ))),
+            ProcessStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn process_status_from_stat_result_other_io_is_unknown() {
+        assert_eq!(
+            process_status_from_stat_result(Err(Error::other("I/O error"))),
+            ProcessStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn process_status_from_stat_result_malformed_is_unknown() {
+        assert_eq!(
+            process_status_from_stat_result(Ok("garbage".into())),
+            ProcessStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn process_status_for_current_process_is_running() {
+        let pid = std::process::id() as i32;
+        assert_eq!(process_status(pid), ProcessStatus::Running);
+    }
+
+    #[test]
+    fn process_status_for_nonexistent_pid_is_exited() {
+        // PIDs this high are unused on Linux; /proc/<pid>/stat returns ENOENT.
+        assert_eq!(process_status(i32::MAX), ProcessStatus::Exited);
+    }
+
+    #[test]
+    fn process_status_for_invalid_pid_is_unknown() {
+        assert_eq!(process_status(0), ProcessStatus::Unknown);
+        assert_eq!(process_status(-1), ProcessStatus::Unknown);
     }
 }
