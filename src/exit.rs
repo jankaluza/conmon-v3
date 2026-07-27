@@ -1,15 +1,17 @@
 use crate::error::{ConmonError, ConmonResult};
 
+use atomic_write_file::AtomicWriteFile;
 use log::{error, info, warn};
 use nix::errno::Errno;
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
 
+use std::io::{self, Write};
 use std::os::fd::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 use std::time::Duration;
-use std::{fs, thread};
 
 use nix::libc::{PR_SET_CHILD_SUBREAPER, close, prctl};
 
@@ -102,6 +104,17 @@ pub fn run_exit_command(
     Ok(())
 }
 
+/// Atomically write `contents` to `path` via `atomic-write-file`.
+///
+/// Same intent as conmon-v2 `g_file_set_contents`: inotify waiters never see a
+/// truncated/empty exit file.
+fn write_file_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    let mut file = AtomicWriteFile::options().open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.commit()?;
+    Ok(())
+}
+
 /// Writes exit files into persistent_path and exit_dir.
 pub fn write_exit_files(
     exit_status: i32,
@@ -114,7 +127,7 @@ pub fn write_exit_files(
     // Write the exit file to container persistent directory if it is specified
     if let Some(persist_path) = persist_path {
         let ctr_exit_file_path: PathBuf = persist_path.join("exit");
-        if let Err(e) = fs::write(&ctr_exit_file_path, &status_str) {
+        if let Err(e) = write_file_atomic(&ctr_exit_file_path, &status_str) {
             error!(
                 "Failed to write {} to container exit file {}: {}",
                 status_str,
@@ -129,7 +142,7 @@ pub fn write_exit_files(
     if let Some(exit_dir) = exit_dir {
         if let Some(cid) = cid {
             let exit_file_path: PathBuf = exit_dir.join(cid);
-            if let Err(e) = fs::write(&exit_file_path, &status_str) {
+            if let Err(e) = write_file_atomic(&exit_file_path, &status_str) {
                 error!(
                     "Failed to write {} to exit file {}: {}",
                     status_str,
@@ -227,5 +240,112 @@ pub fn close_all_except_stdio(snap: &OpenFilesSnapshot) {
             // Best-effort: ignore EBADF and any other errors (common when racing / already closed).
             let _ = unsafe { close(fd) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::thread;
+    use tempfile::tempdir;
+
+    #[test]
+    fn write_exit_files_writes_contents() -> io::Result<()> {
+        let dir = tempdir()?;
+        let persist = dir.path().to_path_buf();
+
+        write_exit_files(42, Some(&persist), None, None);
+
+        let path = persist.join("exit");
+        assert_eq!(std::fs::read_to_string(&path)?, "42");
+        Ok(())
+    }
+
+    #[test]
+    fn write_exit_files_replaces_existing_file() -> io::Result<()> {
+        let dir = tempdir()?;
+        let persist = dir.path().to_path_buf();
+        std::fs::write(persist.join("exit"), "old")?;
+
+        write_exit_files(7, Some(&persist), None, None);
+
+        assert_eq!(std::fs::read_to_string(persist.join("exit"))?, "7");
+        Ok(())
+    }
+
+    #[test]
+    fn write_exit_files_leaves_no_temp_files() -> io::Result<()> {
+        let dir = tempdir()?;
+        let persist = dir.path().to_path_buf();
+
+        write_exit_files(0, Some(&persist), None, None);
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| {
+                let name = n.to_string_lossy();
+                name != "exit" && name.starts_with('.')
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temps: {leftovers:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn write_exit_files_replaces_destination_symlink_not_target() -> io::Result<()> {
+        let dir = tempdir()?;
+        let persist = dir.path().to_path_buf();
+        let target = dir.path().join("secret");
+        std::fs::write(&target, "untouched")?;
+        std::os::unix::fs::symlink(&target, persist.join("exit"))?;
+
+        write_exit_files(1, Some(&persist), None, None);
+
+        let path = persist.join("exit");
+        assert_eq!(std::fs::read_to_string(&path)?, "1");
+        assert_eq!(std::fs::read_to_string(&target)?, "untouched");
+        assert!(!std::fs::symlink_metadata(&path)?.file_type().is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    fn write_exit_files_to_exit_dir_uses_cid_name() -> io::Result<()> {
+        let dir = tempdir()?;
+        let exit_dir = dir.path().to_path_buf();
+        let cid = String::from("abc123");
+
+        write_exit_files(9, None, Some(&exit_dir), Some(&cid));
+
+        assert_eq!(std::fs::read_to_string(exit_dir.join(&cid))?, "9");
+        Ok(())
+    }
+
+    #[test]
+    fn write_file_atomic_concurrent_writers_do_not_clobber_temp() -> io::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("exit");
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                write_file_atomic(&path, &i.to_string())
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread panicked")?;
+        }
+
+        let contents = std::fs::read_to_string(&path)?;
+        assert!(
+            matches!(
+                contents.as_str(),
+                "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7"
+            ),
+            "unexpected contents {contents:?}"
+        );
+        Ok(())
     }
 }
