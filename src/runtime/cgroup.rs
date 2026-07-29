@@ -210,7 +210,7 @@ pub fn check_cgroup2_oom(
                 if err.raw_os_error() == Some(libc::ENOENT) {
                     debug!(
                         "Cgroup appears to have been removed, stopping OOM monitoring: {}",
-                        &memory_events_file_path.to_string_lossy(),
+                        memory_events_file_path.to_string_lossy(),
                     );
                     return false;
                 }
@@ -316,7 +316,7 @@ fn create_oom_file(base_path: &Path) -> Result<(), ()> {
         Err(_) => {
             warn!(
                 "Failed to write oom file to the path {}",
-                &base_path.to_string_lossy(),
+                base_path.to_string_lossy(),
             );
             return Err(());
         }
