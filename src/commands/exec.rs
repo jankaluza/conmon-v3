@@ -47,7 +47,7 @@ impl Exec {
         // runtime_session.write_container_pid_file(&self.cfg.common)?;
         runtime_session.write_exit_code(self.cfg.common.api_version, true)?;
 
-        Ok(runtime_session.container_exit_code())
+        Ok(runtime_session.container_exit_code().unwrap_or(-1))
     }
 }
 

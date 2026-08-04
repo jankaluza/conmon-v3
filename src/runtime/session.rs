@@ -8,7 +8,6 @@ use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::unistd::{Pid, getpgid};
 use nix::{
     errno::Errno,
-    libc,
     sys::{
         socket::{SockFlag, SockType},
         stat::Mode,
@@ -26,11 +25,21 @@ use crate::{
     runtime::{
         args::{RuntimeArgsGenerator, generate_runtime_args},
         ctl::{setup_console_fifo, setup_terminal_control_fifo},
-        process::RuntimeProcess,
+        process::{ProcessStatus, RuntimeProcess},
         stdio::{create_pipe, handle_stdio, read_pipe, receive_console_fd},
     },
     unix_socket::{RemoteSocket, SocketType, UnixSocket},
 };
+
+/// Result of a single non-blocking child-process poll during the event loop.
+enum PollChildrenResult {
+    /// Keep polling sockets and reaping children.
+    KeepRunning,
+    /// Stop the event loop (container or runtime finished).
+    StopEventLoop,
+    /// Reaped an unrelated child; call again so pending zombies are drained.
+    ReapedOther,
+}
 
 /// Represents Runtime session.
 /// Handles spawning of runtime process, reading its stdio, writing its
@@ -58,8 +67,8 @@ pub struct RuntimeSession {
     /// Any data read from here should be treated as container's standard error.
     mainfd_stderr: Option<OwnedFd>,
 
-    /// Exit code of `process`.
-    exit_code: i32,
+    /// Exit code of `process`, or `None` until it is known.
+    exit_code: Option<i32>,
 
     /// UnixSocket for `attach`.
     /// The process executing conmon uses it to attach to container. It opens new
@@ -88,11 +97,11 @@ pub struct RuntimeSession {
     // True if container started.
     container_started: bool,
 
-    /// The PID of container created by the runtime.
-    container_pid: i32,
+    /// The PID of container created by the runtime, or `None` until known / after reap.
+    container_pid: Option<i32>,
 
-    /// The exit status of container.
-    container_status: i32,
+    /// The exit status of container, or `None` until known.
+    container_status: Option<i32>,
 
     // Time (unix timestamp) after which the session should terminate
     timeout: u64,
@@ -120,9 +129,9 @@ impl RuntimeSession {
     pub fn new(open_files: OpenFilesSnapshot) -> Self {
         Self {
             process: RuntimeProcess::new(),
-            exit_code: -1,
-            container_pid: -1,
-            container_status: -1,
+            exit_code: None,
+            container_pid: None,
+            container_status: None,
             timed_out: false,
             container_started: false,
             open_files,
@@ -130,22 +139,30 @@ impl RuntimeSession {
         }
     }
 
-    /// Returns the exit_code of "runtime" process.
+    /// Returns the exit code of the "runtime" process.
     ///
     /// # Returns
     ///
-    /// * The exit code of "runtime" process.
-    pub fn exit_code(&self) -> i32 {
+    /// * `Some(code)` once the runtime has exited, or `None` if still unknown.
+    pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
     }
 
-    /// Returns the container's exit_code.
+    /// Returns the container's exit code.
+    ///
+    /// Timeout is reported as `Some(-1)` to match conmon v2. An unset status is
+    /// `None` rather than a sentinel `-1`.
     ///
     /// # Returns
     ///
-    /// * The exit code of container.
-    pub fn container_exit_code(&self) -> i32 {
-        self.container_status
+    /// * `Some(code)` when the container exit status is known (or timed out)
+    /// * `None` when the status is still unknown
+    pub fn container_exit_code(&self) -> Option<i32> {
+        if self.timed_out {
+            Some(-1)
+        } else {
+            self.container_status
+        }
     }
 
     /// Reads and returns the container's PID.
@@ -423,21 +440,24 @@ impl RuntimeSession {
     ///
     /// * [`ConmonError`] on any error.
     pub fn write_container_pid_file(&mut self, common: &CommonCfg) -> ConmonResult<()> {
-        // Read the container PID and store it.
-        self.container_pid = self.read_container_pid(common)?;
+        self.container_pid = Some(self.read_container_pid(common)?);
 
-        // We know the container started, so note it.
+        // Preserve the PID for the sync pipe / OOM setup even if a pending exit
+        // immediately clears `container_pid` (fast-exiting exec).
+        let reported_pid = self.container_pid.expect("container_pid just set");
         self.container_started = true;
+
+        // Now that container_pid is known, reap any children that already exited.
+        self.reap_pending_children()?;
 
         // Setup the out-of-mana (eh, *-memory) handler, so we can detect OOM event
         // and pass it to parent.
-        self.oom_socket =
-            setup_oom_handling(self.container_pid, &common.persist_dir, &common.bundle)?;
+        self.oom_socket = setup_oom_handling(reported_pid, &common.persist_dir, &common.bundle)?;
 
         // Pass the container_pid to sync_pipe if there is one.
         if let Some(fd) = self.sync_pipe_fd.take() {
             self.sync_pipe_fd =
-                write_or_close_sync_fd(fd, self.container_pid, None, common.api_version, false)?;
+                write_or_close_sync_fd(fd, reported_pid, None, common.api_version, false)?;
         }
 
         Ok(())
@@ -474,12 +494,20 @@ impl RuntimeSession {
             }
 
             // Prepare the exit code according to the `write_exit_code`.
+            // Sync-pipe wire format still uses -1 for "unknown / timed out".
             let mut to_report = -1;
 
-            if self.container_started {
-                to_report = self.container_status
-            } else if write_exit_code && self.exit_code > 0 {
-                to_report = -self.exit_code;
+            if self.timed_out {
+                to_report = -1;
+            } else if self.container_started {
+                if self.container_status.is_none() {
+                    self.finalize_container_exit()?;
+                }
+                to_report = self.container_status.unwrap_or(-1);
+            } else if write_exit_code {
+                if let Some(code) = self.exit_code.filter(|&c| c > 0) {
+                    to_report = -code;
+                }
             }
 
             let err_msg = if self.timed_out {
@@ -519,8 +547,9 @@ impl RuntimeSession {
     ///
     /// * [`ConmonError`] on any error.
     pub fn wait(&mut self) -> ConmonResult<i32> {
-        self.exit_code = self.process.wait()?;
-        Ok(self.exit_code)
+        let code = self.process.wait()?;
+        self.exit_code = Some(code);
+        Ok(code)
     }
 
     /// Waits for the Runtime process to exit. Returns the exit code.
@@ -547,13 +576,181 @@ impl RuntimeSession {
     ) -> ConmonResult<()> {
         // Wait until the `runtime create` finishes.
         self.wait()?;
-        if self.exit_code != 0 {
+        if self.exit_code != Some(0) {
             self.write_exit_code(api_version, write_exit_code)?;
             return Err(ConmonError::new(
-                format!("Runtime exited with status: {}", self.exit_code),
+                format!(
+                    "Runtime exited with status: {}",
+                    self.exit_code
+                        .map_or_else(|| "unknown".to_string(), |c| c.to_string())
+                ),
                 1,
             ));
         }
+        Ok(())
+    }
+
+    /// Records a terminal `Exited` / `Signaled` wait status for the container.
+    fn handle_container_wait_status(&mut self, status: WaitStatus) {
+        match status {
+            WaitStatus::Exited(_, code) => {
+                self.container_status = Some(code);
+                self.container_pid = None;
+                info!("Container exited: {code}");
+            }
+            WaitStatus::Signaled(_, signal, _) => {
+                let code = 128 + signal as i32;
+                self.container_status = Some(code);
+                self.container_pid = None;
+                info!("Container killed with signal: {code}");
+            }
+            other => unreachable!("expected terminal wait status, got {other:?}"),
+        }
+    }
+
+    /// When the process is gone but its exit status is unknown, assume success only
+    /// if we never recorded a status (matches conmon-v2's ECHILD fallback).
+    fn assume_container_exited_without_status(&mut self) {
+        if self.container_status.is_none() {
+            info!("Container process has exited with unknown status; assuming 0");
+            self.container_status = Some(0);
+        }
+        self.container_pid = None;
+    }
+
+    /// Non-blocking wait for any child, mirroring conmon-v2's `check_child_processes`.
+    fn poll_children_once(&mut self) -> ConmonResult<PollChildrenResult> {
+        let res = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
+
+        match res {
+            Err(Errno::EINTR) => Ok(PollChildrenResult::KeepRunning),
+
+            Err(Errno::ECHILD) => {
+                if let Some(raw_pid) = self.container_pid {
+                    let pid = Pid::from_raw(raw_pid);
+
+                    // After waitpid(-1) returns ECHILD there are no waitable children,
+                    // so a targeted waitpid cannot reveal a status. Probe /proc instead.
+                    match ProcessStatus::from_pid(pid) {
+                        ProcessStatus::Running => {
+                            info!("Container process {pid} is still alive");
+                            return Ok(PollChildrenResult::KeepRunning);
+                        }
+                        ProcessStatus::Unknown => {
+                            // Permission/IO/parse failure - do not invent an exit code.
+                            info!("Container process {pid} status unknown via /proc; will retry");
+                            return Ok(PollChildrenResult::KeepRunning);
+                        }
+                        ProcessStatus::Exited => {
+                            info!("Container process {pid} has exited (detected via /proc)");
+                            self.assume_container_exited_without_status();
+                            return Ok(PollChildrenResult::StopEventLoop);
+                        }
+                    }
+                }
+
+                // Container already reaped (status known, pid cleared) or never started.
+                // Do not keep the event loop alive forever on ECHILD.
+                if self.container_status.is_some() || !self.container_started {
+                    Ok(PollChildrenResult::StopEventLoop)
+                } else {
+                    Ok(PollChildrenResult::KeepRunning)
+                }
+            }
+
+            Err(e) => Err(ConmonError::new(
+                format!("Failed to read child process status: {e}"),
+                1,
+            )),
+
+            Ok(WaitStatus::StillAlive) => Ok(PollChildrenResult::KeepRunning),
+
+            Ok(WaitStatus::Exited(p, code)) => {
+                if self.container_pid == Some(p.as_raw()) {
+                    self.handle_container_wait_status(WaitStatus::Exited(p, code));
+                    Ok(PollChildrenResult::StopEventLoop)
+                } else if p == Pid::from_raw(self.process.pid()) {
+                    self.exit_code = Some(code);
+                    info!("Runtime exited: {code}");
+                    Ok(PollChildrenResult::StopEventLoop)
+                } else {
+                    info!("Unknown child {p} exited");
+                    // Keep draining so reap_pending_children() can clear remaining zombies.
+                    Ok(PollChildrenResult::ReapedOther)
+                }
+            }
+
+            Ok(WaitStatus::Signaled(p, s, coredump)) => {
+                if self.container_pid == Some(p.as_raw()) {
+                    self.handle_container_wait_status(WaitStatus::Signaled(p, s, coredump));
+                    Ok(PollChildrenResult::StopEventLoop)
+                } else if p == Pid::from_raw(self.process.pid()) {
+                    let code = 128 + s as i32;
+                    self.exit_code = Some(code);
+                    info!("Runtime killed with signal: {code}");
+                    Ok(PollChildrenResult::StopEventLoop)
+                } else {
+                    info!("Unknown child {p} exited");
+                    Ok(PollChildrenResult::ReapedOther)
+                }
+            }
+
+            Ok(
+                WaitStatus::Stopped(_, _)
+                | WaitStatus::Continued(_)
+                | WaitStatus::PtraceEvent(_, _, _)
+                | WaitStatus::PtraceSyscall(_),
+            ) => Ok(PollChildrenResult::KeepRunning),
+        }
+    }
+
+    /// Reap any children that already exited before / during the event loop.
+    ///
+    /// Exec processes can finish immediately after the PID is written to the sync pipe.
+    /// Unrelated zombies are drained via [`PollChildrenResult::ReapedOther`].
+    pub fn reap_pending_children(&mut self) -> ConmonResult<()> {
+        loop {
+            if self.container_status.is_some() {
+                return Ok(());
+            }
+            match self.poll_children_once()? {
+                PollChildrenResult::ReapedOther => continue,
+                PollChildrenResult::KeepRunning | PollChildrenResult::StopEventLoop => {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Ensure the container exit status is known before writing exit files.
+    pub fn finalize_container_exit(&mut self) -> ConmonResult<()> {
+        if self.container_status.is_some() {
+            return Ok(());
+        }
+
+        self.reap_pending_children()?;
+        if self.container_status.is_some() {
+            return Ok(());
+        }
+
+        if let Some(raw_pid) = self.container_pid {
+            let pid = Pid::from_raw(raw_pid);
+            // reap_pending_children() already drained waitpid(-1). If the process
+            // is still tracked, it is not a waitable child - probe /proc only.
+            match ProcessStatus::from_pid(pid) {
+                ProcessStatus::Exited => {
+                    info!("Container process {pid} has exited (final probe)");
+                    self.assume_container_exited_without_status();
+                }
+                ProcessStatus::Running => {}
+                ProcessStatus::Unknown => {
+                    info!(
+                        "Container process {pid} status unknown via /proc at finalize; leaving unset"
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -574,6 +771,12 @@ impl RuntimeSession {
     ///
     /// * [`ConmonError`] on any error.
     fn idle_callback(&mut self, signal_received: bool) -> ConmonResult<bool> {
+        // Fast-exiting exec processes may already have a recorded status before
+        // the event loop starts (or right after the first reap). Stop immediately.
+        if self.container_status.is_some() {
+            return Ok(false);
+        }
+
         // We received a signal.
         if signal_received {
             if let Some(signals) = &self.signals {
@@ -583,8 +786,8 @@ impl RuntimeSession {
                         if let Ok(sig) = Signal::try_from(info.ssi_signo as i32) {
                             // Forward the signal the container if it's running.
                             info!("Received signal: {:?}", sig);
-                            if self.container_pid > 0 {
-                                let pid = Pid::from_raw(self.container_pid);
+                            if let Some(raw_pid) = self.container_pid {
+                                let pid = Pid::from_raw(raw_pid);
                                 kill(pid, sig)?;
                             }
                         }
@@ -593,7 +796,7 @@ impl RuntimeSession {
                     Err(_) => return Ok(true),
                 }
             }
-            return Ok(true);
+            return Ok(self.container_status.is_none());
         }
 
         // Stop the event-loop if we reach a timeout.
@@ -601,8 +804,8 @@ impl RuntimeSession {
         if self.timeout > 0 && now.as_secs() > self.timeout {
             info!("Timed out - exiting event-loop.");
             // Kill the container in case it exists.
-            if self.container_pid > 0 {
-                let pid = Pid::from_raw(self.container_pid);
+            if let Some(raw_pid) = self.container_pid {
+                let pid = Pid::from_raw(raw_pid);
                 // Get the process group ID of the container
                 let pgid = getpgid(Some(pid))?;
 
@@ -621,98 +824,9 @@ impl RuntimeSession {
             return Ok(false);
         }
 
-        // Wait for any child to finish (non-blocking).
-        let res = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
-
-        match res {
-            // Interrupted by signal - retry.
-            Err(Errno::EINTR) => Ok(true),
-
-            // no more child processes
-            Err(Errno::ECHILD) => {
-                // Before quitting, probe the container_pid.
-                // It might not be a direct child.
-                if self.container_pid > 0 {
-                    // Nix kill function does not support 0 signal, so we have to use libc one.
-                    let rc = unsafe { libc::kill(self.container_pid, 0) };
-                    if rc == 0 {
-                        info!(
-                            "Container process {} is still alive but not a direct child",
-                            self.container_pid
-                        );
-                        // Do not quit main loop yet...
-                        return Ok(true);
-                    } else if Errno::last() == Errno::ESRCH {
-                        // Process exited.
-                        info!(
-                            "Container process {} has exited (detected via kill probe)",
-                            self.container_pid
-                        );
-                        // We cannot get real exit status.
-                        self.container_status = 0;
-                        self.container_pid = -1;
-                        return Ok(false);
-                    } else {
-                        info!("No more child processes.");
-                        return Ok(false);
-                    }
-                }
-
-                // If container has not started yet, keep running.
-                Ok(!self.container_started)
-            }
-
-            // some other waitpid error
-            Err(e) => Err(ConmonError::new(
-                format!("Failed to read child process status: {e}"),
-                1,
-            )),
-
-            // No child has changed state.
-            Ok(WaitStatus::StillAlive) => Ok(true),
-
-            // Child exited, store the exit code.
-            Ok(WaitStatus::Exited(p, code)) => {
-                if p == Pid::from_raw(self.container_pid) {
-                    self.container_status = code;
-                    info!("Container exited: {}", self.container_status);
-                    return Ok(false);
-                } else if p == Pid::from_raw(self.process.pid()) {
-                    self.exit_code = code;
-                    info!("Runtime exited: {}", self.exit_code);
-                    return Ok(false);
-                } else {
-                    info!("Uknown child {} exited", p);
-                }
-                Ok(true)
-            }
-
-            // Child killed with a signal, store it as exit code.
-            Ok(WaitStatus::Signaled(p, s, _)) => {
-                let code: i32 = s as i32;
-                if p == Pid::from_raw(self.container_pid) {
-                    self.container_status = 128 + code;
-                    info!("Container killed with signal: {}", self.container_status);
-                    return Ok(false);
-                } else if p == Pid::from_raw(self.process.pid()) {
-                    self.exit_code = 128 + code;
-                    info!("Runtime killed with signal: {}", self.exit_code);
-                    return Ok(false);
-                } else {
-                    info!("Uknown child {} exited", p);
-                }
-                Ok(true)
-            }
-
-            Ok(
-                WaitStatus::Stopped(_, _)
-                | WaitStatus::Continued(_)
-                | WaitStatus::PtraceEvent(_, _, _)
-                | WaitStatus::PtraceSyscall(_),
-            ) => {
-                // Just continue with the event-loop.
-                Ok(true)
-            }
+        match self.poll_children_once()? {
+            PollChildrenResult::KeepRunning | PollChildrenResult::ReapedOther => Ok(true),
+            PollChildrenResult::StopEventLoop => Ok(false),
         }
     }
 
@@ -758,6 +872,7 @@ impl RuntimeSession {
                 signal_fd,
                 |signal_received| self.idle_callback(signal_received),
             )?;
+            self.finalize_container_exit()?;
             return Ok(());
         }
 
@@ -792,7 +907,7 @@ mod tests {
     fn exit_code_defaults_and_accessor_work() {
         let open_files = OpenFilesSnapshot::default();
         let s = RuntimeSession::new(open_files);
-        assert_eq!(s.exit_code(), -1);
+        assert_eq!(s.exit_code(), None);
     }
 
     #[test]
@@ -877,10 +992,10 @@ mod tests {
             sync_pipe_fd: Some(sync_w),
             mainfd_stderr: Some(stderr_r),
             container_started: true,
-            container_status: 0,
+            container_status: Some(0),
             timeout: 0,
             timed_out: true,
-            exit_code: 1,
+            exit_code: Some(1),
             ..Default::default()
         };
         let sync_w_fd = sess.sync_pipe_fd.as_ref().unwrap().as_raw_fd();
@@ -909,7 +1024,7 @@ mod tests {
         let mut sess = RuntimeSession::new(OpenFilesSnapshot::default());
         sess.sync_pipe_fd = Some(sync_w);
         sess.mainfd_stderr = Some(stderr_r);
-        sess.exit_code = 1;
+        sess.exit_code = Some(1);
         sess.container_started = false;
 
         sess.write_exit_code(0, false)?;
@@ -930,6 +1045,142 @@ mod tests {
     }
 
     #[test]
+    fn finalize_container_exit_probes_exited_pid() -> ConmonResult<()> {
+        let open_files = OpenFilesSnapshot::default();
+        let mut sess = RuntimeSession::new(open_files);
+        sess.container_started = true;
+        sess.container_pid = Some(nix::unistd::getpid().as_raw());
+        // Current process is alive; finalize should leave status unset.
+        sess.finalize_container_exit()?;
+        assert_eq!(sess.container_status, None);
+
+        // A PID that no longer exists should be treated as exited.
+        sess.container_status = None;
+        sess.container_pid = Some(999_999_999);
+        sess.finalize_container_exit()?;
+        assert_eq!(sess.container_status, Some(0));
+        assert_eq!(sess.container_pid, None);
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_container_exit_is_noop_when_status_known() -> ConmonResult<()> {
+        let open_files = OpenFilesSnapshot::default();
+        let mut sess = RuntimeSession::new(open_files);
+        sess.container_started = true;
+        sess.container_status = Some(1);
+        sess.container_pid = Some(999_999_999);
+        sess.finalize_container_exit()?;
+        assert_eq!(sess.container_status, Some(1));
+        assert_eq!(sess.container_pid, Some(999_999_999));
+        Ok(())
+    }
+
+    #[test]
+    fn handle_container_wait_status_records_normal_exit() {
+        let mut sess = RuntimeSession::new(OpenFilesSnapshot::default());
+        sess.container_pid = Some(4242);
+        sess.handle_container_wait_status(WaitStatus::Exited(Pid::from_raw(4242), 7));
+        assert_eq!(sess.container_status, Some(7));
+        assert_eq!(sess.container_pid, None);
+    }
+
+    #[test]
+    fn handle_container_wait_status_records_signal_exit() {
+        let mut sess = RuntimeSession::new(OpenFilesSnapshot::default());
+        sess.container_pid = Some(4242);
+        sess.handle_container_wait_status(WaitStatus::Signaled(
+            Pid::from_raw(4242),
+            Signal::SIGKILL,
+            false,
+        ));
+        assert_eq!(sess.container_status, Some(128 + Signal::SIGKILL as i32));
+        assert_eq!(sess.container_pid, None);
+    }
+
+    #[test]
+    fn fast_exit_before_event_loop_stops_idle_callback() -> ConmonResult<()> {
+        let mut sess = RuntimeSession::new(OpenFilesSnapshot::default());
+        sess.container_started = true;
+        sess.container_pid = Some(4242);
+        // Simulate an exec that exited after PID registration but before the loop
+        // (write_container_pid_file registers PID, then reap_pending_children).
+        // End-to-end coverage for this path is the TMT `/podman` system suite.
+        sess.handle_container_wait_status(WaitStatus::Exited(Pid::from_raw(4242), 5));
+        assert!(!sess.idle_callback(false)?);
+        assert_eq!(sess.container_exit_code(), Some(5));
+        Ok(())
+    }
+
+    #[test]
+    fn echild_keeps_running_for_live_non_child_process() -> ConmonResult<()> {
+        let mut sess = RuntimeSession::new(OpenFilesSnapshot::default());
+        sess.container_started = true;
+        sess.container_pid = Some(nix::unistd::getpid().as_raw());
+        assert!(matches!(
+            sess.poll_children_once()?,
+            PollChildrenResult::KeepRunning
+        ));
+        assert_eq!(sess.container_status, None);
+        Ok(())
+    }
+
+    #[test]
+    fn echild_stops_for_exited_process() -> ConmonResult<()> {
+        let mut sess = RuntimeSession::new(OpenFilesSnapshot::default());
+        sess.container_started = true;
+        sess.container_pid = Some(999_999_999);
+        assert!(matches!(
+            sess.poll_children_once()?,
+            PollChildrenResult::StopEventLoop
+        ));
+        assert_eq!(sess.container_status, Some(0));
+        assert_eq!(sess.container_pid, None);
+        Ok(())
+    }
+
+    #[test]
+    fn container_exit_code_is_none_when_status_unknown() {
+        let sess = RuntimeSession::new(OpenFilesSnapshot::default());
+        assert_eq!(sess.container_exit_code(), None);
+    }
+
+    #[test]
+    fn container_exit_code_is_minus_one_after_timeout() {
+        let open_files = OpenFilesSnapshot::default();
+        let mut sess = RuntimeSession::new(open_files);
+        sess.container_status = Some(137);
+        sess.timed_out = true;
+        assert_eq!(sess.container_exit_code(), Some(-1));
+    }
+
+    #[test]
+    fn poll_children_stops_after_status_known_and_pid_cleared() -> ConmonResult<()> {
+        let open_files = OpenFilesSnapshot::default();
+        let mut sess = RuntimeSession::new(open_files);
+        sess.container_started = true;
+        sess.container_status = Some(1);
+        sess.container_pid = None;
+        // No children left: previously this returned KeepRunning forever.
+        assert!(matches!(
+            sess.poll_children_once()?,
+            PollChildrenResult::StopEventLoop
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn idle_callback_stops_when_container_already_exited() -> ConmonResult<()> {
+        let open_files = OpenFilesSnapshot::default();
+        let mut sess = RuntimeSession::new(open_files);
+        sess.container_started = true;
+        sess.container_status = Some(0);
+        sess.container_pid = None;
+        assert!(!sess.idle_callback(false)?);
+        Ok(())
+    }
+
+    #[test]
     fn write_exit_code_is_noop_without_sync_fd() -> ConmonResult<()> {
         // If no syncpipe FD was captured in launch(), write_exit_code should simply succeed
         // and not attempt to read from stderr (so it must not block).
@@ -946,7 +1197,7 @@ mod tests {
         sess.mainfd_stderr = Some(r);
 
         // Also set an exit code to make sure the function path is covered.
-        sess.exit_code = 42;
+        sess.exit_code = Some(42);
 
         // No sync_pipe_fd set -> should be a no-op success.
         let res = sess.write_exit_code(1, true);

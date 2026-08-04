@@ -53,7 +53,7 @@ impl Restore {
         // Wait for the `runtime exec` to finish and write its exit code.
         runtime_session.write_exit_code(self.cfg.common.api_version, false)?;
 
-        Ok(runtime_session.container_exit_code())
+        Ok(runtime_session.container_exit_code().unwrap_or(-1))
     }
 }
 
