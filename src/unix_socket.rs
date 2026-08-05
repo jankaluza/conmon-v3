@@ -1,15 +1,16 @@
 use std::{
     fmt,
-    os::fd::{AsFd, OwnedFd},
+    io::IoSlice,
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
     path::{Path, PathBuf},
 };
 
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use nix::{
     errno::Errno,
     fcntl::OFlag,
     sys::{
-        socket::{MsgFlags, SockaddrStorage, recvfrom, sendto},
+        socket::{MsgFlags, Shutdown, SockaddrStorage, recvfrom, sendto, shutdown},
         uio::writev,
     },
     unistd::{read, write},
@@ -23,7 +24,7 @@ use crate::{
 use std::{
     ffi::OsStr,
     io,
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::{AsRawFd, FromRawFd, RawFd},
     os::unix::ffi::OsStrExt,
 };
 
@@ -38,8 +39,6 @@ use nix::{
     },
     unistd::{mkstemp, symlinkat, unlink},
 };
-
-use ::log::info;
 
 // Type of the UnixSocket and RemoteSocket.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
@@ -658,6 +657,49 @@ pub enum Socket {
     Invalid(),
 }
 
+/// Retry a syscall that may return `EINTR` before completion.
+fn retry_on_eintr<T, F>(mut f: F) -> Result<T, Errno>
+where
+    F: FnMut() -> Result<T, Errno>,
+{
+    loop {
+        match f() {
+            Err(Errno::EINTR) => continue,
+            result => return result,
+        }
+    }
+}
+
+/// Forward `buffers` to a peer with a single `writev`.
+///
+/// Returns `true` only on a complete write. On partial write, `EAGAIN`, or any
+/// other error, shuts the peer down (without closing the raw FD — the live
+/// `OwnedFd` still owns it) and returns `false` so `retain` drops it from the
+/// forwarding list.
+fn forward_to_client(fd: RawFd, buffers: &[IoSlice<'_>]) -> bool {
+    let expected: usize = buffers.iter().map(|b| b.len()).sum();
+    // SAFETY: `fd` is still owned by a RemoteSocket listed in the forward vectors.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+
+    match retry_on_eintr(|| writev(borrowed, buffers)) {
+        Ok(written) if written == expected => return true,
+        Ok(written) => {
+            warn!("Partial forward to fd {fd}: {written} of {expected} bytes");
+        }
+        Err(err) => {
+            warn!("Forward to fd {fd} failed: {err}");
+        }
+    }
+
+    if let Err(err) = shutdown(fd, Shutdown::Both) {
+        if !matches!(err, Errno::ENOTCONN | Errno::EINVAL | Errno::ENOTSOCK) {
+            warn!("Failed to shut down forwarding peer {fd}: {err}");
+        }
+    }
+
+    false
+}
+
 impl Socket {
     /// Handles the POLLIN event for a Socket.
     ///
@@ -678,8 +720,8 @@ impl Socket {
         log_plugin: &mut dyn LogPlugin,
         new_sockets: &mut Vec<RemoteSocket>,
         workerfd_stdin: Option<&OwnedFd>,
-        console_fds: &Vec<i32>,
-        terminal_fds: &Vec<i32>,
+        console_fds: &mut Vec<RawFd>,
+        terminal_fds: &mut Vec<RawFd>,
         stdout_fd: i32,
         sdnotify_socket: &Option<PathBuf>,
     ) -> ConmonResult<bool> {
@@ -707,7 +749,11 @@ impl Socket {
 
                 // If the Socket has a handler, call the handler directly and return.
                 if let Some(handler) = r.handler.as_mut() {
-                    return Ok(handler(&r.buf[..bytes_read]));
+                    // Buffer starts empty for each handle_data wake (see clear_buffer below),
+                    // so `bytes_read` spans the packet just received at the front of `buf`.
+                    let keep = handler(&r.buf[..bytes_read]);
+                    r.clear_buffer();
+                    return Ok(keep);
                 }
 
                 match r.socket_type {
@@ -729,16 +775,15 @@ impl Socket {
                         // buffer has 8192+1 bytes. It would be nice to unify that, but we need to
                         // keep the backwards compatibility for now. We also have to keep using
                         // SOCKET_SEQPACKET and therefore everything needs to be sent in a single packet.
+                        // Incomplete delivery stops forwarding and shuts the peer down.
                         let data = &r.buf[..bytes_read];
                         for chunk in data.chunks(CONMON_CLIENT_BUFFER_SIZE) {
-                            for &fd in console_fds {
-                                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-                                let iov = [
-                                    std::io::IoSlice::new(prefix_buf),
-                                    std::io::IoSlice::new(chunk),
-                                ];
-                                writev(borrowed, &iov)?;
-                            }
+                            console_fds.retain(|&fd| {
+                                forward_to_client(
+                                    fd,
+                                    &[IoSlice::new(prefix_buf), IoSlice::new(chunk)],
+                                )
+                            });
                         }
                         r.clear_buffer();
                     }
@@ -748,12 +793,11 @@ impl Socket {
                             let bytes_written = write(workerfd_stdin, &r.buf[..bytes_read])?;
                             info!("bytes written: {}", bytes_written);
                         }
-                        // Forward data to terminal.
-                        for &fd in terminal_fds {
+                        // Forward data to terminal. Incomplete delivery stops forwarding.
+                        terminal_fds.retain(|&fd| {
                             debug!("Forwarding to terminal {}", fd);
-                            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-                            write(borrowed, &r.buf[..bytes_read])?;
-                        }
+                            forward_to_client(fd, &[IoSlice::new(&r.buf[..bytes_read])])
+                        });
                         r.clear_buffer();
                     }
                     SocketType::Notify => {
@@ -853,5 +897,153 @@ mod notify_filter_tests {
         assert!(should_forward_notify_line("STATUS=foo"));
         assert!(!should_forward_notify_line("BARRIER=1"));
         assert!(!should_forward_notify_line("READY=1BARRIER=1"));
+    }
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+    use std::os::fd::AsFd;
+
+    fn seqpacket_pair() -> nix::Result<(OwnedFd, OwnedFd)> {
+        socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )
+    }
+
+    fn fill_seqpacket(write_fd: &OwnedFd) {
+        let packet = vec![0u8; 1024];
+        loop {
+            match write(write_fd, &packet) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(Errno::EAGAIN) => break,
+                Err(e) => panic!("fill_seqpacket: {e}"),
+            }
+        }
+    }
+
+    fn poll_revents(fd: &OwnedFd, events: PollFlags) -> nix::Result<PollFlags> {
+        let mut pfd = [PollFd::new(fd.as_fd(), events)];
+        let n = poll(&mut pfd, PollTimeout::from(500u16))?;
+        if n == 0 {
+            return Ok(PollFlags::empty());
+        }
+        Ok(pfd[0].revents().unwrap_or(PollFlags::empty()))
+    }
+
+    #[test]
+    fn retry_on_eintr_retries_until_success() {
+        let mut attempts = 0;
+        let result = retry_on_eintr(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(Errno::EINTR)
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(result, Ok(7));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn attach_seqpacket_delivers_complete_packet() -> nix::Result<()> {
+        let (client, server) = seqpacket_pair()?;
+        let prefix = [2u8];
+        let chunk = vec![b'x'; CONMON_CLIENT_BUFFER_SIZE];
+        assert!(forward_to_client(
+            server.as_raw_fd(),
+            &[IoSlice::new(&prefix), IoSlice::new(&chunk)]
+        ));
+
+        let mut buf = vec![0u8; 1 + CONMON_CLIENT_BUFFER_SIZE + 8];
+        let n = read(&client, &mut buf)?;
+        assert_eq!(n, 1 + CONMON_CLIENT_BUFFER_SIZE);
+        assert_eq!(buf[0], 2);
+        assert!(buf[1..n].iter().all(|&b| b == b'x'));
+        Ok(())
+    }
+
+    #[test]
+    fn attach_seqpacket_eagain_stops_forwarding_and_shuts_down() -> nix::Result<()> {
+        let (_client, server) = seqpacket_pair()?;
+        fill_seqpacket(&server);
+
+        let mut forward_fds = vec![server.as_raw_fd()];
+        forward_fds
+            .retain(|&fd| forward_to_client(fd, &[IoSlice::new(&[2]), IoSlice::new(b"blocked")]));
+        assert!(forward_fds.is_empty());
+
+        let local = poll_revents(&server, PollFlags::POLLIN | PollFlags::POLLHUP)?;
+        assert!(
+            local.contains(PollFlags::POLLHUP),
+            "shutdown must surface local POLLHUP for event-loop removal; got {local:?}"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod handler_buffer_tests {
+    use super::*;
+    use crate::logging::none_logger::NoneLogger;
+    use crate::logging::plugin::LogPluginCfg;
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+    use std::sync::mpsc;
+
+    #[test]
+    fn handle_data_clears_buffer_after_custom_handler() -> ConmonResult<()> {
+        // Without clear_buffer after the handler, the next read appends into the
+        // rolling buffer and the handler may see a stale prefix of prior packets.
+        let (sender, receiver) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        write(&sender, b"aa")?;
+        write(&sender, b"bbb")?;
+
+        let (tx, rx) = mpsc::channel();
+        let mut remote = RemoteSocket::new(SocketType::Console, receiver);
+        remote.set_handler(move |data| {
+            let _ = tx.send(data.to_vec());
+            true
+        });
+
+        let mut socket = Socket::Remote(remote);
+        let mut log_plugin = NoneLogger::new(&LogPluginCfg::default())?;
+        let mut new_sockets = Vec::new();
+        let mut console_fds = Vec::new();
+        let mut terminal_fds = Vec::new();
+
+        assert!(socket.handle_data(
+            &mut log_plugin,
+            &mut new_sockets,
+            None,
+            &mut console_fds,
+            &mut terminal_fds,
+            -1,
+            &None,
+        )?);
+        assert!(socket.handle_data(
+            &mut log_plugin,
+            &mut new_sockets,
+            None,
+            &mut console_fds,
+            &mut terminal_fds,
+            -1,
+            &None,
+        )?);
+
+        assert_eq!(rx.recv().unwrap(), b"aa");
+        assert_eq!(rx.recv().unwrap(), b"bbb");
+        Ok(())
     }
 }

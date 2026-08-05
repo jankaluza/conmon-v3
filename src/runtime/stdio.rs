@@ -334,18 +334,18 @@ where
         // We will mutate fds/remote_sockets, so iterate by index.
         let mut i = 0;
         while i < fds.len() {
-            // The poll fd.
-            let pfd = &fds[i];
             // If `false`, we close the socket completely.
             let mut keep_socket = true;
             // if `false`, we close the read side of the socket.
             let mut continue_reading = true;
 
-            if let Some(revents) = pfd.revents() {
+            let revents = fds[i].revents();
+            let polled_fd = fds[i].as_fd().as_raw_fd();
+            if let Some(revents) = revents {
                 if revents.contains(PollFlags::POLLIN) {
                     // If the POLLIN comes from the signal fd, run the idle_callback to handle
                     // the received signal.
-                    if pfd.as_fd().as_raw_fd() == signal_fd {
+                    if polled_fd == signal_fd {
                         idle_callback(true)?;
                         i += 1;
                         continue;
@@ -356,8 +356,8 @@ where
                         log_plugin,
                         &mut new_sockets,
                         workerfd_stdin.as_ref(),
-                        &console_fds,
-                        &terminal_fds,
+                        &mut console_fds,
+                        &mut terminal_fds,
                         stdout_fd,
                         &notify_host_path,
                     )?;
@@ -381,8 +381,12 @@ where
                         new_sockets.clear();
                     }
                 } else if revents.contains(PollFlags::POLLHUP) {
-                    // On HUP, close the socket.
-                    debug!("HUP on {:?}", pfd);
+                    // Hangup with nothing readable: nothing left to drain.
+                    continue_reading = false;
+                }
+                // Drain readable SEQPACKET data before removing on hangup.
+                if revents.contains(PollFlags::POLLHUP) && !continue_reading {
+                    debug!("HUP on fd {}", polled_fd);
                     keep_socket = false;
                 }
             }
@@ -433,10 +437,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::none_logger::NoneLogger;
+    use crate::logging::plugin::LogPluginCfg;
+    use nix::poll::PollTimeout;
     use nix::sys::socket::{
         AddressFamily, ControlMessage, SockFlag, SockType, sendmsg, socketpair,
     };
+    use nix::unistd::write;
     use std::io::IoSlice;
+    use std::sync::mpsc;
+
+    fn poll_wait() -> PollTimeout {
+        PollTimeout::from(500u16)
+    }
 
     fn send_fds(count: usize, payload: &[u8]) -> ConmonResult<(OwnedFd, Vec<(OwnedFd, OwnedFd)>)> {
         let (sender, receiver) = socketpair(
@@ -459,6 +472,40 @@ mod tests {
         sendmsg::<()>(sender.as_raw_fd(), &iov, &[cmsg], MsgFlags::empty(), None)?;
 
         Ok((receiver, keepalive))
+    }
+
+    /// One `handle_stdio` wake for a single remote socket.
+    fn process_one_poll_wake(
+        sockets: &mut [Socket],
+        log_plugin: &mut dyn LogPlugin,
+    ) -> ConmonResult<(PollFlags, bool, bool)> {
+        let Socket::Remote(r) = &sockets[0] else {
+            unreachable!();
+        };
+        let mut pfd = [PollFd::new(r.fd.as_fd(), PollFlags::POLLIN)];
+        let n = poll(&mut pfd, poll_wait())?;
+        assert_ne!(n, 0, "expected poll to report activity");
+        let revents = pfd[0].revents().unwrap_or(PollFlags::empty());
+
+        let mut continue_reading = true;
+        let mut new_sockets = Vec::new();
+        let mut console_fds = Vec::new();
+        let mut terminal_fds = Vec::new();
+        if revents.contains(PollFlags::POLLIN) {
+            continue_reading = sockets[0].handle_data(
+                log_plugin,
+                &mut new_sockets,
+                None,
+                &mut console_fds,
+                &mut terminal_fds,
+                -1,
+                &None,
+            )?;
+        } else if revents.contains(PollFlags::POLLHUP) {
+            continue_reading = false;
+        }
+        let remove = revents.contains(PollFlags::POLLHUP) && !continue_reading;
+        Ok((revents, continue_reading, remove))
     }
 
     #[test]
@@ -514,6 +561,46 @@ mod tests {
                 "recycled FD number must not remain in console_fds"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn pollinhup_drains_queued_seqpacket_messages_before_removal() -> ConmonResult<()> {
+        let (sender, receiver) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )?;
+        let expected = [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()];
+        for msg in expected {
+            assert_eq!(write(&sender, msg)?, msg.len());
+        }
+        drop(sender);
+
+        let (tx, rx) = mpsc::channel();
+        let mut remote = RemoteSocket::new(SocketType::Console, receiver);
+        remote.set_handler(move |data| {
+            let _ = tx.send(data.to_vec());
+            true
+        });
+        let mut sockets = vec![Socket::Remote(remote)];
+        let mut log_plugin = NoneLogger::new(&LogPluginCfg::default())?;
+
+        let mut removed = false;
+        for _ in 0..expected.len() + 2 {
+            let (revents, continue_reading, remove) =
+                process_one_poll_wake(&mut sockets, &mut log_plugin)?;
+            if remove {
+                assert!(revents.contains(PollFlags::POLLHUP) && !continue_reading);
+                let got: Vec<Vec<u8>> = rx.try_iter().collect();
+                assert_eq!(got, expected.map(|m| m.to_vec()));
+                removed = true;
+                break;
+            }
+            assert!(continue_reading);
+        }
+        assert!(removed);
         Ok(())
     }
 }
