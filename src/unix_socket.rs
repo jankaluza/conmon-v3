@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use nix::{
     errno::Errno,
     fcntl::OFlag,
@@ -38,8 +38,6 @@ use nix::{
     },
     unistd::{mkstemp, symlinkat, unlink},
 };
-
-use ::log::info;
 
 // Type of the UnixSocket and RemoteSocket.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
@@ -218,63 +216,44 @@ impl RemoteSocket {
         Ok(n)
     }
 
-    /// Returns a pointer + length to the next newline-terminated line.
+    /// Returns the next newline-terminated control line as owned UTF-8 text.
     ///
-    /// After returning the line, it advances buf_start and compacts whatever remains.
+    /// Consumes a complete line (including the trailing `\n`) by advancing
+    /// `buf_start` before UTF-8 decoding so invalid UTF-8 cannot be retried
+    /// forever. Remaining bytes stay in place until `read()` compacts the
+    /// buffer when more space is needed.
     ///
     /// # Returns
     ///
-    /// * (pointer to line, length of the line)
-    /// * None if no complete line is available.
-    ///
-    /// # Arguments
-    ///
-    /// * `allow_partial` - If true, if returns the buffer content even if it does
-    ///   not end with a new-line character.
-    pub fn next_line(&mut self, allow_partial: bool) -> Option<(*const u8, usize)> {
-        // Search for '\n' in the available buffer slice.
-        if let Some(rel) = self.buf[self.buf_start..self.buf_end]
+    /// * `Ok(Some(line))` - A complete line including the trailing `\n`.
+    /// * `Ok(None)` - No complete newline-terminated line is buffered yet.
+    /// * `Err(_)` - The consumed line is not valid UTF-8.
+    pub fn next_line(&mut self) -> ConmonResult<Option<String>> {
+        let Some(rel) = self.buf[self.buf_start..self.buf_end]
             .iter()
             .position(|&b| b == b'\n')
-        {
-            let line_start = self.buf_start;
-            let line_end = line_start + rel + 1; // include '\n'
-            let len = line_end - line_start;
+        else {
+            return Ok(None);
+        };
 
-            // Get raw pointer BEFORE altering the buffer.
-            let ptr = self.buf[line_start..line_end].as_ptr();
+        let line_start = self.buf_start;
+        let line_end = line_start + rel + 1; // include '\n'
+        let raw = self.buf[line_start..line_end].to_vec();
 
-            // Advance buffer start.
-            self.buf_start = line_end;
-
-            // If consumed everything, reset indices.
-            if self.buf_start == self.buf_end {
-                self.buf_start = 0;
-                self.buf_end = 0;
-            } else {
-                self.compact_buffer();
-            }
-
-            return Some((ptr, len));
-        }
-
-        // No '\n' found
-        if allow_partial && self.buf_start < self.buf_end {
-            let line_start = self.buf_start;
-            let line_end = self.buf_end;
-            let len = line_end - line_start;
-
-            // Raw pointer to remaining data
-            let ptr = self.buf[line_start..line_end].as_ptr();
-
-            // Consume everything
+        // Advance before decoding so invalid UTF-8 is not retried forever.
+        self.buf_start = line_end;
+        if self.buf_start == self.buf_end {
             self.buf_start = 0;
             self.buf_end = 0;
-
-            return Some((ptr, len));
         }
 
-        None
+        match String::from_utf8(raw) {
+            Ok(line) => Ok(Some(line)),
+            Err(err) => Err(ConmonError::new(
+                format!("control line is not valid UTF-8: {err}"),
+                1,
+            )),
+        }
     }
 }
 
@@ -780,18 +759,27 @@ impl Socket {
                     }
                     SocketType::TerminalFifo | SocketType::ConsoleFifo => {
                         // We received control message for "ctlr" or "winsz".
-                        // Handle all complete lines.
-                        while let Some((ptr, len)) = r.next_line(false) {
-                            let line = unsafe { std::slice::from_raw_parts(ptr, len) };
-                            let line_str = String::from_utf8_lossy(line);
+                        // Handle all complete lines. Invalid UTF-8 is logged and
+                        // skipped like other malformed control lines, so one bad
+                        // line cannot abort the stdio event loop.
+                        loop {
+                            let line = match r.next_line() {
+                                Ok(Some(line)) => line,
+                                Ok(None) => break,
+                                Err(err) => {
+                                    warn!("failed to decode control line: {err}");
+                                    continue;
+                                }
+                            };
+
                             if r.socket_type == SocketType::TerminalFifo {
                                 if let Err(err) =
-                                    process_terminal_ctrl_line(log_plugin, stdout_fd, &line_str)
+                                    process_terminal_ctrl_line(log_plugin, stdout_fd, &line)
                                 {
-                                    warn!("failed to process terminal ctrl line: {}", err);
+                                    warn!("failed to process terminal ctrl line: {err}");
                                 }
-                            } else if let Err(err) = process_winsz_ctrl_line(stdout_fd, &line_str) {
-                                warn!("failed to process terminal winsz line: {}", err);
+                            } else if let Err(err) = process_winsz_ctrl_line(stdout_fd, &line) {
+                                warn!("failed to process terminal winsz line: {err}");
                             }
                         }
                     }
@@ -816,8 +804,10 @@ mod notify_filter_tests {
     }
 
     #[test]
-    fn drops_barrier_line() {
+    fn drops_rejected_lines() {
         assert_eq!(filter_notify_payload(b"BARRIER=1\n"), b"");
+        assert!(filter_notify_payload(b"BARRIER=1").is_empty());
+        assert!(filter_notify_payload(b"BARRIER=1\nUNKNOWN=1\n").is_empty());
     }
 
     #[test]
@@ -847,11 +837,116 @@ mod notify_filter_tests {
     }
 
     #[test]
+    fn multi_line_datagram_stays_one_filtered_payload() {
+        // A single sd-notify datagram may contain several assignments. Filtering must
+        // keep permitted fields together in one combined payload.
+        let datagram = b"STATUS=ok\nREADY=1\nBARRIER=1\nWATCHDOG=1\n";
+        assert_eq!(
+            filter_notify_payload(datagram),
+            b"STATUS=ok\nREADY=1\nWATCHDOG=1\n"
+        );
+    }
+
+    #[test]
+    fn datagram_without_trailing_newline_is_complete() {
+        // The final assignment in a systemd notify datagram need not end with '\n'.
+        assert_eq!(filter_notify_payload(b"READY=1"), b"READY=1\n");
+        assert_eq!(
+            filter_notify_payload(b"STATUS=ok\nREADY=1"),
+            b"STATUS=ok\nREADY=1\n"
+        );
+    }
+
+    #[test]
     fn should_forward_notify_line_matches_v2_whitelist() {
         assert!(should_forward_notify_line("READY=1"));
         assert!(should_forward_notify_line("WATCHDOG=trigger"));
         assert!(should_forward_notify_line("STATUS=foo"));
         assert!(!should_forward_notify_line("BARRIER=1"));
         assert!(!should_forward_notify_line("READY=1BARRIER=1"));
+    }
+}
+
+#[cfg(test)]
+mod next_line_tests {
+    use super::*;
+
+    fn socket_with_buffered_data(data: &[u8], socket_type: SocketType) -> RemoteSocket {
+        let (r, _w) = nix::unistd::pipe2(OFlag::O_CLOEXEC).expect("pipe");
+        let mut socket = RemoteSocket::new(socket_type, r);
+        assert!(
+            data.len() <= socket.buf.len(),
+            "test data exceeds RemoteSocket buffer capacity"
+        );
+        let len = data.len();
+        socket.buf[..len].copy_from_slice(data);
+        socket.buf_start = 0;
+        socket.buf_end = len;
+        socket
+    }
+
+    #[test]
+    fn next_line_returns_both_fifo_control_lines() -> ConmonResult<()> {
+        let mut socket = socket_with_buffered_data(b"1 80 24\n2 0 0\n", SocketType::TerminalFifo);
+
+        let first = socket.next_line()?.expect("first line");
+        assert_eq!(first, "1 80 24\n");
+
+        let second = socket.next_line()?.expect("second line");
+        assert_eq!(second, "2 0 0\n");
+
+        assert!(socket.next_line()?.is_none());
+        assert_eq!(socket.buf_start, 0);
+        assert_eq!(socket.buf_end, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn next_line_owned_string_remains_valid_after_next_call() -> ConmonResult<()> {
+        let mut socket = socket_with_buffered_data(b"a\nbc\n", SocketType::ConsoleFifo);
+
+        let first = socket.next_line()?.expect("first line");
+        let second = socket.next_line()?.expect("second line");
+
+        assert_eq!(first, "a\n");
+        assert_eq!(second, "bc\n");
+        Ok(())
+    }
+
+    #[test]
+    fn next_line_extracts_second_line_without_eager_compaction() -> ConmonResult<()> {
+        let mut socket = socket_with_buffered_data(b"a\nbc\n", SocketType::ConsoleFifo);
+
+        assert_eq!(socket.next_line()?.as_deref(), Some("a\n"));
+        assert!(socket.buf_start > 0);
+
+        assert_eq!(socket.next_line()?.as_deref(), Some("bc\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn next_line_preserves_incomplete_trailing_data() -> ConmonResult<()> {
+        let mut socket = socket_with_buffered_data(b"first\npartial", SocketType::ConsoleFifo);
+
+        assert_eq!(socket.next_line()?.as_deref(), Some("first\n"));
+        assert!(socket.next_line()?.is_none());
+        assert_eq!(&socket.buf[socket.buf_start..socket.buf_end], b"partial");
+        Ok(())
+    }
+
+    #[test]
+    fn next_line_consumes_invalid_utf8_and_preserves_following_line() {
+        let mut socket = socket_with_buffered_data(b"ok\n\xff\nlater\n", SocketType::TerminalFifo);
+
+        assert_eq!(socket.next_line().unwrap().as_deref(), Some("ok\n"));
+
+        let err = socket
+            .next_line()
+            .expect_err("invalid UTF-8 must be an explicit error");
+        assert!(err.to_string().contains("not valid UTF-8"));
+
+        // Invalid line was consumed; later valid lines remain available.
+        assert_eq!(socket.next_line().unwrap().as_deref(), Some("later\n"));
+        assert!(socket.next_line().unwrap().is_none());
     }
 }
