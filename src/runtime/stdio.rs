@@ -184,6 +184,33 @@ fn remove_forward_fd(console_fds: &mut Vec<RawFd>, terminal_fds: &mut Vec<RawFd>
     fds.retain(|&candidate| candidate != fd);
 }
 
+/// Handle a peer that reached read-side EOF without dropping the socket.
+///
+/// Attach clients often EOF the read side immediately (no stdin) while still
+/// expecting stdout/stderr writes, so Console FDs stay in `console_fds`.
+/// Terminal peers stop receiving forwarded stdin.
+fn on_peer_read_eof(
+    terminal_fds: &mut Vec<RawFd>,
+    socket: &Socket,
+    stdin_attached: bool,
+    leave_stdin_open: bool,
+    workerfd_stdin: &mut Option<OwnedFd>,
+) {
+    let Socket::Remote(remote) = socket else {
+        return;
+    };
+
+    match remote.socket_type {
+        SocketType::Console if stdin_attached && !leave_stdin_open => {
+            workerfd_stdin.take();
+        }
+        SocketType::Terminal => {
+            terminal_fds.retain(|&candidate| candidate != remote.fd.as_raw_fd());
+        }
+        _ => {}
+    }
+}
+
 /// Handles incomming data on fds and forwards them to right destination.
 /// This function blocks until the container is running.
 /// # Arguments
@@ -398,20 +425,13 @@ where
                 // Remove it from fds we call poll for.
                 fds[i].set_events(PollFlags::empty());
 
-                // Stop forwarding container output/input to this closed peer.
-                remove_forward_fd(&mut console_fds, &mut terminal_fds, &sockets[i]);
-
-                if let Socket::Remote(r) = &sockets[i] {
-                    if r.socket_type == SocketType::Console && stdin_attached {
-                        // We closed the Console socket attached to container's stdin.
-                        // This normally means we also close the container's stdin, unless
-                        // the called instructed us no to do it using the `--leave-stdin-open`.
-                        if !leave_stdin_open {
-                            // This closes the socket, since it moves out of scope.
-                            workerfd_stdin.take();
-                        }
-                    }
-                }
+                on_peer_read_eof(
+                    &mut terminal_fds,
+                    &sockets[i],
+                    stdin_attached,
+                    leave_stdin_open,
+                    &mut workerfd_stdin,
+                );
             }
 
             if keep_socket {
@@ -491,6 +511,65 @@ mod tests {
         let mut buf = [0u8; 16];
         let recv = recv_data_and_fds(receiver.as_raw_fd(), &mut buf);
         assert_eq!(recv.err(), Some(Errno::ENOBUFS));
+        Ok(())
+    }
+
+    #[test]
+    fn read_eof_keeps_attach_fd_in_console_fds() -> ConmonResult<()> {
+        let (attach_r, _attach_w) = pipe2(OFlag::O_CLOEXEC)?;
+        let attach_fd = attach_r.as_raw_fd();
+        let (stdin_r, stdin_w) = pipe2(OFlag::O_CLOEXEC)?;
+        drop(stdin_r);
+        let sockets = [Socket::Remote(RemoteSocket::new(
+            SocketType::Console,
+            attach_r,
+        ))];
+        let console_fds = [attach_fd];
+        let mut terminal_fds = Vec::new();
+        let mut workerfd_stdin = Some(stdin_w);
+
+        on_peer_read_eof(
+            &mut terminal_fds,
+            &sockets[0],
+            true,
+            false,
+            &mut workerfd_stdin,
+        );
+
+        assert!(
+            console_fds.contains(&attach_fd),
+            "attach FD must remain in console_fds after read-side EOF"
+        );
+        assert!(
+            workerfd_stdin.is_none(),
+            "container stdin is closed when the attach client EOFs"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_eof_stops_forwarding_to_terminal() -> ConmonResult<()> {
+        let (term_r, _term_w) = pipe2(OFlag::O_CLOEXEC)?;
+        let term_fd = term_r.as_raw_fd();
+        let sockets = [Socket::Remote(RemoteSocket::new(
+            SocketType::Terminal,
+            term_r,
+        ))];
+        let mut terminal_fds = vec![term_fd];
+        let mut workerfd_stdin = None;
+
+        on_peer_read_eof(
+            &mut terminal_fds,
+            &sockets[0],
+            false,
+            false,
+            &mut workerfd_stdin,
+        );
+
+        assert!(
+            !terminal_fds.contains(&term_fd),
+            "terminal FD must be removed from terminal_fds after read-side EOF"
+        );
         Ok(())
     }
 
