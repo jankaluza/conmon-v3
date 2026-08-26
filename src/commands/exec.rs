@@ -31,10 +31,18 @@ impl Exec {
             runtime_session.wait_for_terminal_creation()?;
         }
 
-        // Wait until the `runtime create` finishes and return an error in case it fails.
-        runtime_session.wait_for_success(self.cfg.common.api_version, true)?;
+        // Wait for the runtime to finish. Unlike create, a non-zero runtime exit
+        // is not itself a failure for exec (it may be the exec'd command's status).
+        // Matching conmon-v2, "runtime failed to start the process" is detected by
+        // a missing pidfile below.
+        runtime_session.wait()?;
 
-        runtime_session.write_container_pid_file(&self.cfg.common)?;
+        // If the runtime never wrote the pidfile, the process was never started.
+        // Report -1 (not -runtime_status) and the runtime stderr to the sync pipe.
+        if let Err(err) = runtime_session.write_container_pid_file(&self.cfg.common) {
+            runtime_session.write_exit_code(self.cfg.common.api_version, false)?;
+            return Err(err);
+        }
 
         // Run the eventloop to forward log messages to log plugin.
         runtime_session.run_event_loop(
@@ -44,7 +52,6 @@ impl Exec {
         )?;
 
         // Wait for the `runtime exec` to finish and write its exit code.
-        // runtime_session.write_container_pid_file(&self.cfg.common)?;
         runtime_session.write_exit_code(self.cfg.common.api_version, true)?;
 
         Ok(runtime_session.container_exit_code().unwrap_or(-1))
