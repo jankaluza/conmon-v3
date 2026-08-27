@@ -28,7 +28,7 @@ fi
 mkdir -p /var/run/crio
 
 # Show installed package versions
-rpm -q conmon-v3 runc
+rpm -q conmon-v3 runc crun podman
 
 # Run e2e tests using the installed conmon-v3 binary
 # Use timeout to ensure we don't hang waiting for background processes
