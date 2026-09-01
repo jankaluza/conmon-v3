@@ -131,6 +131,7 @@ dependencies = [
  "atomic-write-file",
  "chrono",
  "clap",
+ "getrandom",
  "log",
  "mockall",
  "nix",
