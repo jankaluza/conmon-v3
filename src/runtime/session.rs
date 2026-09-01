@@ -903,8 +903,28 @@ impl RuntimeSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::unistd::write;
+    use crate::cli::test_common_cfg;
+    use nix::unistd::{ForkResult, fork, write};
+    use std::process::exit;
     use tempfile::tempdir;
+
+    /// Run `f` in a forked child so `waitpid(-1)` is not racing other tests' children.
+    fn with_clean_child_table(f: impl FnOnce() -> ConmonResult<()>) -> ConmonResult<()> {
+        match unsafe { fork() }.map_err(|e| ConmonError::new(format!("fork failed: {e}"), 1))? {
+            ForkResult::Child => match f() {
+                Ok(()) => exit(0),
+                Err(_) => exit(1),
+            },
+            ForkResult::Parent { child } => match waitpid(child, None) {
+                Ok(WaitStatus::Exited(_, 0)) => Ok(()),
+                Ok(status) => Err(ConmonError::new(
+                    format!("child failed with status {status:?}"),
+                    1,
+                )),
+                Err(e) => Err(ConmonError::new(format!("waitpid failed: {e}"), 1)),
+            },
+        }
+    }
 
     #[test]
     fn exit_code_defaults_and_accessor_work() {
@@ -923,7 +943,7 @@ mod tests {
             container_pidfile: pid_path,
             conmon_pidfile: None,
             api_version: 1,
-            ..Default::default()
+            ..test_common_cfg("unused")
         };
 
         let open_files = OpenFilesSnapshot::default();
@@ -943,7 +963,7 @@ mod tests {
             container_pidfile: pid_path.clone(),
             conmon_pidfile: None,
             api_version: 1,
-            ..Default::default()
+            ..test_common_cfg("unused")
         };
 
         let open_files = OpenFilesSnapshot::default();
@@ -1117,29 +1137,34 @@ mod tests {
 
     #[test]
     fn echild_keeps_running_for_live_non_child_process() -> ConmonResult<()> {
-        let mut sess = RuntimeSession::new(OpenFilesSnapshot::default());
-        sess.container_started = true;
-        sess.container_pid = Some(nix::unistd::getpid().as_raw());
-        assert!(matches!(
-            sess.poll_children_once()?,
-            PollChildrenResult::KeepRunning
-        ));
-        assert_eq!(sess.container_status, None);
-        Ok(())
+        with_clean_child_table(|| {
+            let mut sess = RuntimeSession::new(OpenFilesSnapshot::default());
+            sess.container_started = true;
+            sess.container_pid = Some(nix::unistd::getpid().as_raw());
+            assert!(matches!(
+                sess.poll_children_once()?,
+                PollChildrenResult::KeepRunning
+            ));
+            assert_eq!(sess.container_status, None);
+            Ok(())
+        })
     }
 
     #[test]
     fn echild_stops_for_exited_process() -> ConmonResult<()> {
-        let mut sess = RuntimeSession::new(OpenFilesSnapshot::default());
-        sess.container_started = true;
-        sess.container_pid = Some(999_999_999);
-        assert!(matches!(
-            sess.poll_children_once()?,
-            PollChildrenResult::StopEventLoop
-        ));
-        assert_eq!(sess.container_status, Some(0));
-        assert_eq!(sess.container_pid, None);
-        Ok(())
+        with_clean_child_table(|| {
+            let mut sess = RuntimeSession::new(OpenFilesSnapshot::default());
+            sess.container_started = true;
+            // Non-existent PID: /proc probe reports Exited after waitpid(-1) → ECHILD.
+            sess.container_pid = Some(999_999_999);
+            assert!(matches!(
+                sess.poll_children_once()?,
+                PollChildrenResult::StopEventLoop
+            ));
+            assert_eq!(sess.container_status, Some(0));
+            assert_eq!(sess.container_pid, None);
+            Ok(())
+        })
     }
 
     #[test]
@@ -1159,28 +1184,32 @@ mod tests {
 
     #[test]
     fn poll_children_stops_after_status_known_and_pid_cleared() -> ConmonResult<()> {
-        let open_files = OpenFilesSnapshot::default();
-        let mut sess = RuntimeSession::new(open_files);
-        sess.container_started = true;
-        sess.container_status = Some(1);
-        sess.container_pid = None;
-        // No children left: previously this returned KeepRunning forever.
-        assert!(matches!(
-            sess.poll_children_once()?,
-            PollChildrenResult::StopEventLoop
-        ));
-        Ok(())
+        with_clean_child_table(|| {
+            let open_files = OpenFilesSnapshot::default();
+            let mut sess = RuntimeSession::new(open_files);
+            sess.container_started = true;
+            sess.container_status = Some(1);
+            sess.container_pid = None;
+            // No children left: previously this returned KeepRunning forever.
+            assert!(matches!(
+                sess.poll_children_once()?,
+                PollChildrenResult::StopEventLoop
+            ));
+            Ok(())
+        })
     }
 
     #[test]
     fn idle_callback_stops_when_container_already_exited() -> ConmonResult<()> {
-        let open_files = OpenFilesSnapshot::default();
-        let mut sess = RuntimeSession::new(open_files);
-        sess.container_started = true;
-        sess.container_status = Some(0);
-        sess.container_pid = None;
-        assert!(!sess.idle_callback(false)?);
-        Ok(())
+        with_clean_child_table(|| {
+            let open_files = OpenFilesSnapshot::default();
+            let mut sess = RuntimeSession::new(open_files);
+            sess.container_started = true;
+            sess.container_status = Some(0);
+            sess.container_pid = None;
+            assert!(!sess.idle_callback(false)?);
+            Ok(())
+        })
     }
 
     #[test]
