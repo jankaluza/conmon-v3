@@ -5,7 +5,7 @@ use ::log::error;
 use ::log::info;
 use clap::Parser;
 use conmon::Cid;
-use conmon::cli::{Cmd, Opts, determine_cmd, determine_log_plugin};
+use conmon::cli::{Cmd, Opts, determine_cmd, determine_log_plugin, validate_log_tag_locale};
 use conmon::commands::create::Create;
 use conmon::commands::exec::Exec;
 use conmon::commands::restore::Restore;
@@ -135,6 +135,15 @@ fn main() -> ExitCode {
     // Parse the command line arguments and clone the ones we need
     // for the exit handling.
     let opts = Opts::parse();
+
+    // Match conmon-v2 GLib option parsing: invalid locale conversion of --log-tag
+    // exits immediately with status 1 and does not run the Podman exit-command
+    // (running cleanup while still alive can deadlock with the parent Wait).
+    if let Err(e) = validate_log_tag_locale(&opts) {
+        eprintln!("conmon: {}", e.msg);
+        return ExitCode::from(e.code);
+    }
+
     let exit_command = opts.exit_command.clone();
     let exit_command_args = opts.exit_args.clone();
     let exit_command_delay = opts.exit_delay;

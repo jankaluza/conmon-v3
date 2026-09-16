@@ -1,5 +1,6 @@
 use crate::Cid;
 use crate::error::{ConmonError, ConmonResult};
+use crate::locale_string::validate_log_tag;
 use crate::logging::plugin::LogPluginCfg;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -460,6 +461,18 @@ pub fn determine_cmd(mut opts: Opts, logging_passthrough: bool) -> ConmonResult<
     }
 }
 
+/// Reject a `--log-tag` that cannot be converted under the process locale.
+///
+/// Matches conmon-v2: GLib option parsing converts every `G_OPTION_ARG_STRING`
+/// (including `--log-tag`) before log-driver selection, and fails immediately
+/// with this error and `exit(1)` before any exit-command / sync-pipe setup.
+pub fn validate_log_tag_locale(opts: &Opts) -> ConmonResult<()> {
+    if let Some(ref tag) = opts.log_tag {
+        validate_log_tag(tag)?;
+    }
+    Ok(())
+}
+
 // Handles the logging related options from `opts` and returns a list of (plugin name, LogPluginCfg)
 // so that multiple log plugins can be configured (one entry per --log-path).
 pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginCfg)>> {
@@ -616,6 +629,54 @@ mod tests {
             _ => panic!("expected Version"),
         }
         Ok(())
+    }
+
+    #[test]
+    fn log_tag_locale_rejected_under_c_for_any_driver() {
+        use crate::locale_string::{LOCALE_CONVERSION_ERROR, LocaleEnvGuard};
+
+        let _env = LocaleEnvGuard::set(Some("C"));
+
+        for log_path in [
+            PathBuf::from("journald"),
+            PathBuf::from("/tmp/log"),
+            PathBuf::from("k8s-file:/tmp/log"),
+        ] {
+            let opts = Opts {
+                log_path: vec![log_path],
+                log_tag: Some("äöüß".into()),
+                ..Default::default()
+            };
+            let err = validate_log_tag_locale(&opts).expect_err("must reject non-ASCII under C");
+            assert_eq!(err.code, 1);
+            assert_eq!(err.msg, LOCALE_CONVERSION_ERROR);
+        }
+    }
+
+    #[test]
+    fn log_tag_locale_accepts_ascii_under_c() {
+        use crate::locale_string::LocaleEnvGuard;
+
+        let _env = LocaleEnvGuard::set(Some("C"));
+        let opts = Opts {
+            log_path: vec![PathBuf::from("/tmp/log")],
+            log_tag: Some("ascii".into()),
+            ..Default::default()
+        };
+        validate_log_tag_locale(&opts).expect("ASCII under C must succeed");
+    }
+
+    #[test]
+    fn log_tag_locale_accepts_non_ascii_under_utf8() {
+        use crate::locale_string::LocaleEnvGuard;
+
+        let _env = LocaleEnvGuard::set_utf8();
+        let opts = Opts {
+            log_path: vec![PathBuf::from("/tmp/log")],
+            log_tag: Some("äöüß".into()),
+            ..Default::default()
+        };
+        validate_log_tag_locale(&opts).expect("UTF-8 locale must accept non-ASCII");
     }
 
     #[test]
