@@ -548,6 +548,8 @@ pub fn determine_log_plugin(opts: &Opts) -> ConmonResult<Vec<(String, LogPluginC
             }
         } else if s == "journald" {
             plugin = "journald".to_string();
+        } else if s == "syslog" {
+            plugin = "syslog".to_string();
         } else if s == "passthrough" {
             plugin = "passthrough".to_string();
         } else if s == "none" || s == "null" || s == "off" {
@@ -910,6 +912,22 @@ mod tests {
         for name in ["none", "null", "off"] {
             let o = Opts {
                 log_path: vec![PathBuf::from(name)],
+                ..Default::default()
+            };
+            let entries = determine_log_plugin(&o)?;
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0, name);
+            assert!(entries[0].1.path.as_os_str().is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bare_syslog_and_journald_are_drivers_not_paths() -> ConmonResult<()> {
+        for name in ["syslog", "journald"] {
+            let o = Opts {
+                log_path: vec![PathBuf::from(name)],
+                cid: Some("0123456789abcdef".into()),
                 ..Default::default()
             };
             let entries = determine_log_plugin(&o)?;
