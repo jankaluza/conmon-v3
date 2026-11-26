@@ -21,7 +21,7 @@ path = "src/main.rs"
 
 [features]
 default = ["splunk"]
-# HTTP Event Collector log driver. Pulls in ureq (and rustls) when enabled.
+# HTTP Event Collector log driver. Pulls in ureq when enabled.
 splunk = ["dep:ureq"]
 
 [dependencies]
@@ -33,7 +33,7 @@ chrono = "0.4"
 systemd = { version = "0.10.1", default-features = false, features = ["journal"] }
 atomic-write-file = "0.3"
 arrayvec = "0.7"
-ureq = { version = "3.5.0", optional = true, default-features = false, features = ["rustls"] }
+ureq = { version = "3.5.0", optional = true, default-features = false, features = ["rustls-no-provider", "_ring", "platform-verifier"] }
 
 [dev-dependencies]
 tempfile = "3"

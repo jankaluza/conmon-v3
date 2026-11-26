@@ -64,6 +64,8 @@ test: unit e2e ## Run both `unit` and `e2e` tests
 .PHONY: unit
 unit: ## Run the unit tests.
 	$(CARGO) test --no-fail-fast
+	# The splunk feature is on by default, so this is what runs the cfg(not) path.
+	$(CARGO) test --no-default-features --bins --lib splunk_driver_rejected_when_feature_disabled
 
 .PHONY: e2e
 e2e: default ## Run the BATS suite in test/bats (includes former conmon-v2 tests).

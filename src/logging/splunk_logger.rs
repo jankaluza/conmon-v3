@@ -10,7 +10,7 @@ use log::warn;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use ureq::tls::TlsConfig;
+use ureq::tls::{RootCerts, TlsConfig};
 use ureq::{Agent, Error as UreqError};
 
 /// Bound on connect + full HTTP round trip. DNS is outside this budget.
@@ -37,7 +37,7 @@ const OPT_INSECURE: &str = "splunk-insecureskipverify";
 /// container.
 pub struct SplunkLogger {
     url: String,
-    token: String,
+    token: Secret,
     source: Option<String>,
     sourcetype: Option<String>,
     index: Option<String>,
@@ -52,7 +52,7 @@ impl std::fmt::Debug for SplunkLogger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SplunkLogger")
             .field("url", &self.url)
-            .field("token", &"[redacted]")
+            .field("token", &self.token)
             .field("source", &self.source)
             .field("sourcetype", &self.sourcetype)
             .field("index", &self.index)
@@ -60,11 +60,6 @@ impl std::fmt::Debug for SplunkLogger {
             .field("tag", &self.tag)
             .finish_non_exhaustive()
     }
-}
-
-struct AttemptError {
-    transient: bool,
-    message: String,
 }
 
 impl SplunkLogger {
@@ -81,7 +76,7 @@ impl SplunkLogger {
 
         Ok(Self {
             url,
-            token,
+            token: Secret::new(token),
             source: nonempty_opt(&opts, OPT_SOURCE),
             sourcetype: nonempty_opt(&opts, OPT_SOURCETYPE),
             index: nonempty_opt(&opts, OPT_INDEX),
@@ -132,26 +127,26 @@ impl SplunkLogger {
     fn deliver(&mut self, payload: &str) -> ConmonResult<()> {
         match self.post_once(payload) {
             Ok(()) => Ok(()),
-            Err(err) if err.transient => {
+            Err(err) if err.is_transient() => {
                 // Drop the pool so the retry does not reuse a bad connection.
                 self.agent = build_agent(self.insecure);
                 match self.post_once(payload) {
                     Ok(()) => Ok(()),
-                    Err(err) => self.fail(err),
+                    Err(err) => Err(self.fail(err)),
                 }
             }
-            Err(err) => self.fail(err),
+            Err(err) => Err(self.fail(err)),
         }
     }
 
-    fn fail(&self, err: AttemptError) -> ConmonResult<()> {
-        let message = redact(&err.message, &self.token);
-        warn!("splunk: failed to send event: {message}");
-        Err(ConmonError::new(format!("splunk: {message}"), 1))
+    fn fail(&self, err: AttemptError) -> ConmonError {
+        let err = err.redacted(self.token.expose());
+        warn!("splunk: failed to send event: {}", err.message());
+        err.into()
     }
 
     fn post_once(&mut self, payload: &str) -> Result<(), AttemptError> {
-        let auth = format!("Splunk {}", self.token);
+        let auth = format!("Splunk {}", self.token.expose());
         let response = self
             .agent
             .post(&self.url)
@@ -160,7 +155,7 @@ impl SplunkLogger {
             .send(payload.as_bytes());
         let mut response = match response {
             Ok(response) => response,
-            Err(err) => return Err(classify_ureq_error(err, &self.token)),
+            Err(err) => return Err(classify_ureq_error(err, self.token.expose())),
         };
         let status = response.status().as_u16();
         let body = match response
@@ -170,7 +165,7 @@ impl SplunkLogger {
             .read_to_string()
         {
             Ok(body) => body,
-            Err(err) => return Err(classify_ureq_error(err, &self.token)),
+            Err(err) => return Err(classify_ureq_error(err, self.token.expose())),
         };
         classify_response(status, &body)
     }
@@ -197,24 +192,74 @@ impl LogPlugin for SplunkLogger {
     }
 }
 
+/// HEC token. `Debug` and `Display` never print the value.
+struct Secret(String);
+
+impl Secret {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl std::fmt::Display for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+enum AttemptError {
+    Transient(String),
+    Permanent(String),
+}
+
 impl AttemptError {
     fn transient(message: impl Into<String>) -> Self {
-        Self {
-            transient: true,
-            message: message.into(),
-        }
+        Self::Transient(message.into())
     }
 
     fn permanent(message: impl Into<String>) -> Self {
-        Self {
-            transient: false,
-            message: message.into(),
+        Self::Permanent(message.into())
+    }
+
+    fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient(_))
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Transient(message) | Self::Permanent(message) => message,
+        }
+    }
+
+    fn redacted(self, token: &str) -> Self {
+        match self {
+            Self::Transient(message) => Self::Transient(redact(&message, token)),
+            Self::Permanent(message) => Self::Permanent(redact(&message, token)),
         }
     }
 }
 
+impl From<AttemptError> for ConmonError {
+    fn from(err: AttemptError) -> Self {
+        ConmonError::new(format!("splunk: {}", err.message()), 1)
+    }
+}
+
 fn build_agent(insecure: bool) -> Agent {
-    let tls = TlsConfig::builder().disable_verification(insecure).build();
+    let tls = TlsConfig::builder()
+        .root_certs(RootCerts::PlatformVerifier)
+        .disable_verification(insecure)
+        .build();
     ureq::Agent::config_builder()
         .timeout_global(Some(IO_TIMEOUT))
         .timeout_connect(Some(IO_TIMEOUT))
@@ -652,6 +697,7 @@ mod tests {
         let rendered = format!("{logger:?}");
         assert!(rendered.contains("[redacted]"));
         assert!(!rendered.contains("sekret"));
+        assert_eq!(logger.token.to_string(), "[redacted]");
     }
 
     #[test]
@@ -814,13 +860,13 @@ mod tests {
 
     #[test]
     fn classify_ureq_tls_and_token_redaction() {
-        assert!(classify_ureq_error(UreqError::ConnectionFailed, "tok").transient);
-        assert!(!classify_ureq_error(UreqError::TlsRequired, "tok").transient);
-        assert!(!classify_ureq_error(UreqError::Tls("cert"), "tok").transient);
-        assert!(!classify_ureq_error(UreqError::BodyExceedsLimit(1), "tok").transient);
+        assert!(classify_ureq_error(UreqError::ConnectionFailed, "tok").is_transient());
+        assert!(!classify_ureq_error(UreqError::TlsRequired, "tok").is_transient());
+        assert!(!classify_ureq_error(UreqError::Tls("cert"), "tok").is_transient());
+        assert!(!classify_ureq_error(UreqError::BodyExceedsLimit(1), "tok").is_transient());
         let err = classify_ureq_error(UreqError::BadUri("sekret".into()), "sekret");
-        assert!(err.message.contains("[redacted]"));
-        assert!(!err.message.contains("sekret"));
+        assert!(err.message().contains("[redacted]"));
+        assert!(!err.message().contains("sekret"));
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();

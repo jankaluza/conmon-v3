@@ -262,8 +262,9 @@ once.
   `code` != 0, and responses over 64 KiB do not retry. After a failed
   line, remaining complete lines in that write are dropped; a partial
   stays buffered. Logging failure does not stop the container.
+  TLS verification uses the platform trust store.
   Not implemented vs Docker: queues, batching, gzip, `json`/`raw`,
-  custom CA, indexer ack, disk buffering.
+  a custom CA file, indexer ack, disk buffering.
 
   Example:
 

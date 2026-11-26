@@ -102,12 +102,10 @@ These Cargo features are enabled by default:
 
 - `splunk`: Splunk HEC log driver. This pulls in `ureq` and rustls.
 
-`cargo build --no-default-features` disables every default feature. Cargo
-has no way to turn off one default feature and leave the others on. With
-the defaults above, that command builds without the Splunk driver and
-without those HTTP dependencies. A default feature can be turned back on
-with `--features`, for example
-`cargo build --no-default-features --features splunk`.
+`cargo build --no-default-features` turns off every
+[default feature](https://doc.rust-lang.org/cargo/reference/features.html#the-default-feature).
+That build omits the Splunk driver and its HTTP dependencies. Turn it back
+on with `cargo build --no-default-features --features splunk`.
 
 There is one option for installation, depending on your environment.
 Each can have the PREFIX overridden. The PREFIX defaults to `/usr/local`
